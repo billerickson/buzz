@@ -79,6 +79,16 @@ fn log_playbook_snapshot_accept(
     }
 }
 
+fn playbook_response(snapshot: &impl serde::Serialize, canonical_event_id: &str) -> String {
+    format!(
+        "response:{}",
+        serde_json::json!({
+            "canonical_event_id": canonical_event_id,
+            "snapshot": snapshot,
+        })
+    )
+}
+
 /// Route a command-kind event to the appropriate handler.
 pub async fn handle_command(
     tenant: &TenantContext,
@@ -400,10 +410,7 @@ async fn handle_playbook_template_revision(
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
-                message: format!(
-                    "response:{}",
-                    serde_json::to_string(&snapshot).unwrap_or_default()
-                ),
+                message: playbook_response(&snapshot, &event.id.to_hex()),
             });
         }
         PersistResult::Inserted(tx) => tx,
@@ -426,10 +433,7 @@ async fn handle_playbook_template_revision(
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::to_string(&snapshot).unwrap_or_default()
-        ),
+        message: playbook_response(&snapshot, &event.id.to_hex()),
     })
 }
 
@@ -474,10 +478,7 @@ async fn handle_playbook_instance_insert(
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
-                message: format!(
-                    "response:{}",
-                    serde_json::to_string(&snapshot).unwrap_or_default()
-                ),
+                message: playbook_response(&snapshot, &event.id.to_hex()),
             });
         }
         PersistResult::Inserted(tx) => tx,
@@ -515,10 +516,7 @@ async fn handle_playbook_instance_insert(
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::to_string(&snapshot).unwrap_or_default()
-        ),
+        message: playbook_response(&snapshot, &event.id.to_hex()),
     })
 }
 
@@ -548,10 +546,7 @@ async fn handle_playbook_item_action(
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
-                message: format!(
-                    "response:{}",
-                    serde_json::to_string(&snapshot).unwrap_or_default()
-                ),
+                message: playbook_response(&snapshot, &event.id.to_hex()),
             });
         }
         PersistResult::Inserted(tx) => tx,
@@ -571,13 +566,11 @@ async fn handle_playbook_item_action(
         tx.rollback()
             .await
             .map_err(|error| IngestError::Internal(format!("error: rollback retry: {error}")))?;
+        let canonical_event_id = hex::encode(applied.canonical_event_id);
         return Ok(IngestResult {
-            event_id: hex::encode(applied.canonical_event_id),
+            event_id: event.id.to_hex(),
             accepted: true,
-            message: format!(
-                "response:{}",
-                serde_json::to_string(&applied.snapshot).unwrap_or_default()
-            ),
+            message: playbook_response(&applied.snapshot, &canonical_event_id),
         });
     }
     let snapshot = applied.snapshot;
@@ -594,10 +587,7 @@ async fn handle_playbook_item_action(
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::to_string(&snapshot).unwrap_or_default()
-        ),
+        message: playbook_response(&snapshot, &event.id.to_hex()),
     })
 }
 
@@ -628,10 +618,7 @@ async fn handle_playbook_structure_operation(
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
-                message: format!(
-                    "response:{}",
-                    serde_json::to_string(&snapshot).unwrap_or_default()
-                ),
+                message: playbook_response(&snapshot, &event.id.to_hex()),
             });
         }
         PersistResult::Inserted(tx) => tx,
@@ -651,13 +638,11 @@ async fn handle_playbook_structure_operation(
         tx.rollback()
             .await
             .map_err(|error| IngestError::Internal(format!("error: rollback retry: {error}")))?;
+        let canonical_event_id = hex::encode(applied.canonical_event_id);
         return Ok(IngestResult {
-            event_id: hex::encode(applied.canonical_event_id),
+            event_id: event.id.to_hex(),
             accepted: true,
-            message: format!(
-                "response:{}",
-                serde_json::to_string(&applied.snapshot).unwrap_or_default()
-            ),
+            message: playbook_response(&applied.snapshot, &canonical_event_id),
         });
     }
     let snapshot = applied.snapshot;
@@ -670,10 +655,7 @@ async fn handle_playbook_structure_operation(
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::to_string(&snapshot).unwrap_or_default()
-        ),
+        message: playbook_response(&snapshot, &event.id.to_hex()),
     })
 }
 

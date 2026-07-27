@@ -16,7 +16,7 @@ use serde_json::Value;
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
-use crate::handlers::ingest::{IngestAuth, IngestError};
+use crate::handlers::ingest::{command_response_field, IngestAuth, IngestError};
 use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found};
@@ -838,11 +838,16 @@ async fn submit_event_authed(
 
     match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
         Ok(result) => {
-            let response = Json(serde_json::json!({
+            let canonical_event_id = command_response_field(&result.message, "canonical_event_id");
+            let mut body = serde_json::json!({
                 "event_id": result.event_id,
                 "accepted": result.accepted,
                 "message": result.message,
-            }));
+            });
+            if let Some(canonical_event_id) = canonical_event_id {
+                body["canonical_event_id"] = canonical_event_id.into();
+            }
+            let response = Json(body);
             SubmitOutcome::Ok {
                 accepted: result.accepted,
                 response,

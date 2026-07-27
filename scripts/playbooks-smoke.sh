@@ -10,7 +10,7 @@ if [[ "${relay_url}" != "http://127.0.0.1:3000" ]]; then
   exit 1
 fi
 
-for command in curl jq uuidgen; do
+for command in cargo curl jq uuidgen; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "error: required command not found: ${command}" >&2
     exit 1
@@ -139,6 +139,11 @@ check_first="$("${buzz_bin}" playbooks check \
   --action-id "${check_action_id}" \
   --client-created-at "${check_client_created_at}")"
 check_event_id="$(jq -er '.event_id' <<<"${check_first}")"
+check_canonical_event_id="$(jq -er '.canonical_event_id' <<<"${check_first}")"
+jq -e \
+  --arg event "${check_event_id}" \
+  '.accepted == true and .canonical_event_id == $event' \
+  <<<"${check_first}" >/dev/null
 checked="$("${buzz_bin}" playbooks get --instance "${instance_id}")"
 jq -e --arg item "${item_id}" \
   '.item_states[] | select(.item_id == $item and .completed == true)' \
@@ -150,7 +155,11 @@ check_retry="$("${buzz_bin}" playbooks check \
   --item "${item_id}" \
   --action-id "${check_action_id}" \
   --client-created-at "${check_client_created_at}")"
-jq -e --arg event "${check_event_id}" '.event_id == $event and .accepted == true' \
+jq -e \
+  --arg canonical "${check_canonical_event_id}" \
+  '.accepted == true
+    and .event_id != $canonical
+    and .canonical_event_id == $canonical' \
   <<<"${check_retry}" >/dev/null
 
 "${buzz_bin}" playbooks reopen --instance "${instance_id}" --item "${item_id}" >/dev/null
@@ -183,6 +192,11 @@ edit_first="$("${buzz_bin}" playbooks edit \
   --instance "${instance_id}" \
   --operation-file "${fixture_dir}/item-add.json")"
 edit_event_id="$(jq -er '.event_id' <<<"${edit_first}")"
+edit_canonical_event_id="$(jq -er '.canonical_event_id' <<<"${edit_first}")"
+jq -e \
+  --arg event "${edit_event_id}" \
+  '.accepted == true and .canonical_event_id == $event' \
+  <<<"${edit_first}" >/dev/null
 edited="$("${buzz_bin}" playbooks get --instance "${instance_id}")"
 jq -e --arg item "${added_item_id}" \
   '.instance.structure_revision == 2
@@ -193,7 +207,11 @@ sleep 1
 edit_retry="$("${buzz_bin}" playbooks edit \
   --instance "${instance_id}" \
   --operation-file "${fixture_dir}/item-add.json")"
-jq -e --arg event "${edit_event_id}" '.event_id == $event and .accepted == true' \
+jq -e \
+  --arg canonical "${edit_canonical_event_id}" \
+  '.accepted == true
+    and .event_id != $canonical
+    and .canonical_event_id == $canonical' \
   <<<"${edit_retry}" >/dev/null
 after_edit_retry="$("${buzz_bin}" playbooks get --instance "${instance_id}")"
 jq -e --arg item "${added_item_id}" \
@@ -231,12 +249,19 @@ structure_command_events="$("${buzz_bin}" messages get \
   --kinds 40203)"
 jq -e 'length == 1' <<<"${structure_command_events}" >/dev/null
 
+RELAY_URL=ws://127.0.0.1:3000 \
+BUZZ_TEST_OWNER_PRIVATE_KEY="${BUZZ_PRIVATE_KEY}" \
+  cargo test -p buzz-test-client --test e2e_relay \
+    test_playbook_semantic_retries_echo_wrapper_and_suppress_fanout \
+    -- --ignored --exact
+
 cat <<SUMMARY
 Playbooks Phase 1 smoke test passed.
   relay:       ${relay_url}
   channel:     ${channel_id}
   template:    ${template_id} (current revision 2)
   instance:    ${instance_id} (isolated revision 1 copy)
-  item:        ${item_id} (semantic retry + complete/reopen history verified)
+  item:        ${item_id} (wrapper/canonical IDs + complete/reopen history verified)
   added item:  ${added_item_id} (semantic edit retry stored once)
+  WebSocket:   wrapper-correlated retries + no second fanout verified
 SUMMARY

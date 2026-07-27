@@ -8,7 +8,8 @@ use tracing::{debug, error, info, warn};
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_unshared_persona_event, AUTHOR_ONLY_KINDS,
-    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PLAYBOOK_ITEM_ACTION,
+    KIND_PLAYBOOK_STRUCTURE_OPERATION, KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -24,11 +25,25 @@ use crate::connection::{AuthState, ConnectionState};
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 
-use super::ingest::{reject_with_transport, IngestAuth, IngestError};
+use super::ingest::{command_response_field, reject_with_transport, IngestAuth, IngestError};
 
 /// Increment the rejection counter with a bounded reason label.
 fn reject(reason: &'static str) {
     reject_with_transport("ws", reason);
+}
+
+fn command_ok_message(kind: u32, submitted_event_id: &str, message: &str) -> String {
+    if matches!(
+        kind,
+        KIND_PLAYBOOK_ITEM_ACTION | KIND_PLAYBOOK_STRUCTURE_OPERATION
+    ) {
+        if let Some(canonical_event_id) = command_response_field(message, "canonical_event_id")
+            .filter(|canonical_event_id| canonical_event_id != submitted_event_id)
+        {
+            return format!("duplicate: canonical_event_id={canonical_event_id}");
+        }
+    }
+    message.to_owned()
 }
 
 /// Bound the `kind` label to prevent cardinality explosion from arbitrary Nostr kinds.
@@ -739,10 +754,11 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             }
             metrics::histogram!("buzz_event_processing_seconds")
                 .record(start.elapsed().as_secs_f64());
+            let ok_message = command_ok_message(kind_u32, &event_id_hex, &result.message);
             conn.send(RelayMessage::ok(
-                &result.event_id,
+                &event_id_hex,
                 result.accepted,
-                &result.message,
+                &ok_message,
             ));
         }
         Err(e) => {
@@ -1162,7 +1178,8 @@ mod tests {
 
     use buzz_core::kind::{
         KIND_AGENT_OBSERVER_FRAME, KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST,
-        KIND_FORUM_VOTE, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF,
+        KIND_FORUM_VOTE, KIND_PLAYBOOK_ITEM_ACTION, KIND_PLAYBOOK_STRUCTURE_OPERATION,
+        KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF,
     };
     use buzz_core::observer::{
         encrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1172,6 +1189,50 @@ mod tests {
     use tokio::sync::{mpsc, Mutex, RwLock};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    #[test]
+    fn playbook_semantic_retry_ok_echoes_wrapper_and_names_canonical_event() {
+        let wrapper_event_id = "b".repeat(64);
+        let canonical_event_id = "a".repeat(64);
+        let response = format!(
+            "response:{}",
+            serde_json::json!({
+                "canonical_event_id": canonical_event_id,
+                "snapshot": {},
+            })
+        );
+        let expected = format!("duplicate: canonical_event_id={}", "a".repeat(64));
+
+        assert_eq!(
+            super::command_ok_message(KIND_PLAYBOOK_ITEM_ACTION, &wrapper_event_id, &response),
+            expected
+        );
+        assert_eq!(
+            super::command_ok_message(
+                KIND_PLAYBOOK_STRUCTURE_OPERATION,
+                &wrapper_event_id,
+                &response
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn first_playbook_acceptance_preserves_projection_response() {
+        let event_id = "a".repeat(64);
+        let response = format!(
+            "response:{}",
+            serde_json::json!({
+                "canonical_event_id": event_id,
+                "snapshot": {},
+            })
+        );
+
+        assert_eq!(
+            super::command_ok_message(KIND_PLAYBOOK_ITEM_ACTION, &"a".repeat(64), &response),
+            response
+        );
+    }
 
     #[test]
     fn fanout_event_frame_matches_legacy_format_byte_for_byte() {

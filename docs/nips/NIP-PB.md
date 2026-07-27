@@ -55,6 +55,25 @@ of any required playbook tag.
 Every tag value MUST agree with its JSON payload. The `d` tag makes projections
 parameterized replaceable; the relay identity is their author.
 
+## Command Results
+
+Every accepted Playbooks result exposes both `event_id` and
+`canonical_event_id`. `event_id` is always the newly submitted signed wrapper.
+On first acceptance, `canonical_event_id` equals `event_id`. On a semantic
+retry, `canonical_event_id` identifies the first stored command while
+`event_id` still identifies the retry wrapper.
+
+The HTTP bridge and CLI expose both identifiers as top-level result fields and
+retain the current projection in the response message. A WebSocket `OK` frame
+always echoes the submitted wrapper in `OK[1]`. A newly signed semantic retry
+MUST return exactly:
+
+```json
+["OK","<wrapper-id>",true,"duplicate: canonical_event_id=<64-lowercase-hex>"]
+```
+
+The retry wrapper is acknowledged but is not stored or broadcast.
+
 ## Template Revisions
 
 A `40200` payload is a complete `TemplateRevision`: stable `template_id`,
@@ -91,11 +110,11 @@ client times. Actions targeting an absent, tombstoned, wrong-channel, or
 archived item MUST be rejected.
 
 `action_id` is a semantic idempotency key. A retry by the same actor with the
-same channel, target, action, and payload returns the canonical first event ID
-and current projection even when the retry has a newly signed wrapper and a
-different event ID. The retry MUST NOT be stored or broadcast and MUST NOT add
-an action or activity row. Reuse by a different actor or with changed semantic
-content MUST conflict.
+same channel, target, action, and payload returns the retry wrapper as
+`event_id`, the first stored command as `canonical_event_id`, and the current
+projection even when the retry has a newly signed wrapper. The retry MUST NOT
+be stored or broadcast and MUST NOT add an action or activity row. Reuse by a
+different actor or with changed semantic content MUST conflict.
 
 ## Structural Operations
 
@@ -115,11 +134,12 @@ tombstones. Restore reuses the original ID; duplicate requires a fresh item ID.
 Archived instances reject all later mutations.
 
 `operation_id` is a semantic idempotency key. A retry by the same actor with the
-same channel, target, base revision, operation, and payload returns the
-canonical first event ID and current projection even when the retry has a
-newly signed wrapper and a different event ID. The retry MUST NOT be stored or
-broadcast and MUST NOT add an audit/activity row or revision. Reuse by a
-different actor or with changed semantic content MUST conflict.
+same channel, target, base revision, operation, and payload returns the retry
+wrapper as `event_id`, the first stored command as `canonical_event_id`, and
+the current projection even when the retry has a newly signed wrapper. The
+retry MUST NOT be stored or broadcast and MUST NOT add an audit/activity row
+or revision. Reuse by a different actor or with changed semantic content MUST
+conflict.
 
 ## Permissions
 

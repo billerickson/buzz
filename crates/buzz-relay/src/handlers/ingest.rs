@@ -174,6 +174,15 @@ pub struct IngestResult {
     pub message: String,
 }
 
+/// Extract a string field from an accepted command message shaped as
+/// `response:{...}`.
+pub(crate) fn command_response_field(message: &str, field: &str) -> Option<String> {
+    message
+        .strip_prefix("response:")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|value| value.get(field)?.as_str().map(str::to_owned))
+}
+
 /// Ingestion error — the caller maps this to their transport's error format.
 #[derive(Debug)]
 pub enum IngestError {
@@ -2572,6 +2581,27 @@ mod tests {
         KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
+
+    #[test]
+    fn command_response_field_extracts_canonical_event_id() {
+        let canonical_event_id = "a".repeat(64);
+        let message = format!(
+            "response:{}",
+            serde_json::json!({
+                "canonical_event_id": canonical_event_id,
+                "snapshot": {},
+            })
+        );
+
+        assert_eq!(
+            command_response_field(&message, "canonical_event_id"),
+            Some("a".repeat(64))
+        );
+        assert_eq!(
+            command_response_field("duplicate:", "canonical_event_id"),
+            None
+        );
+    }
 
     /// A banned relay admin must be refused with the same wire prefix and
     /// transport status as every other durable-restriction refusal:

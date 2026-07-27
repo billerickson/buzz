@@ -1420,12 +1420,17 @@ pub fn extract_relay_response_field(resp: &str, field: &str) -> Option<String> {
 pub fn normalize_write_response(raw: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
         if v.get("event_id").is_some() || v.get("accepted").is_some() {
-            return serde_json::json!({
+            let mut normalized = serde_json::json!({
                 "event_id": v.get("event_id").and_then(|v| v.as_str()).unwrap_or(""),
                 "accepted": v.get("accepted").and_then(|v| v.as_bool()).unwrap_or(false),
                 "message": v.get("message").and_then(|v| v.as_str()).unwrap_or(""),
-            })
-            .to_string();
+            });
+            if let Some(canonical_event_id) =
+                v.get("canonical_event_id").and_then(|value| value.as_str())
+            {
+                normalized["canonical_event_id"] = canonical_event_id.into();
+            }
+            return normalized.to_string();
         }
     }
     raw.to_string()
@@ -2297,7 +2302,8 @@ mod retry_policy_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_query_cursor, create_response_with_id, extract_relay_response_field, BuzzClient,
+        advance_query_cursor, create_response_with_id, extract_relay_response_field,
+        normalize_write_response, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
@@ -2352,6 +2358,15 @@ mod tests {
         assert_eq!(v["workflow_id"].as_str(), Some("relay-id"));
         assert_eq!(v["event_id"].as_str(), Some("abc"));
         assert_eq!(v["accepted"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn normalized_write_response_preserves_canonical_event_id() {
+        let raw = r#"{"event_id":"bbbb","canonical_event_id":"aaaa","accepted":true,"message":"response:{}"}"#;
+        let out: serde_json::Value = serde_json::from_str(&normalize_write_response(raw)).unwrap();
+        assert_eq!(out["event_id"], "bbbb");
+        assert_eq!(out["canonical_event_id"], "aaaa");
+        assert_eq!(out["accepted"], true);
     }
 
     // --- (a) auth-suppression regression pair ---

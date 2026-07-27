@@ -22,8 +22,16 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use buzz_core::kind::{
+    KIND_PLAYBOOK_INSTANCE_INSERT, KIND_PLAYBOOK_ITEM_ACTION, KIND_PLAYBOOK_STRUCTURE_OPERATION,
+    KIND_PLAYBOOK_TEMPLATE_REVISION,
+};
+use buzz_core::playbook::{
+    InstanceInsert, ItemAction, ItemActionKind, PlaybookItem, PlaybookSection, StructureOperation,
+    StructureOperationKind, TemplateRevision, TemplateStatus, PLAYBOOK_SCHEMA_VERSION,
+};
 use buzz_test_client::{BuzzTestClient, RelayMessage, TestClientError};
-use nostr::{Alphabet, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag};
+use nostr::{Alphabet, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag, Timestamp};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -41,6 +49,14 @@ fn relay_http_url() -> String {
         .replace("ws://", "http://")
         .trim_end_matches('/')
         .to_string()
+}
+
+fn relay_authority() -> String {
+    let parsed = url::Url::parse(&relay_url()).expect("parse relay URL");
+    match parsed.port() {
+        Some(port) => format!("{}:{port}", parsed.host_str().expect("relay URL host")),
+        None => parsed.host_str().expect("relay URL host").to_owned(),
+    }
 }
 
 fn test_owner_keys() -> Keys {
@@ -199,6 +215,273 @@ async fn create_test_channel(keys: &Keys) -> String {
     );
 
     channel_uuid.to_string()
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_playbook_semantic_retries_echo_wrapper_and_suppress_fanout() {
+    let url = relay_url();
+    let keys = test_owner_keys();
+    seed_relay_member(&relay_authority(), &keys, "owner").await;
+    let channel = create_test_channel(&keys).await;
+    let channel_id = Uuid::parse_str(&channel).expect("channel UUID");
+    let template_id = Uuid::new_v4();
+    let instance_id = Uuid::new_v4();
+    let section_id = Uuid::new_v4();
+    let item_id = Uuid::new_v4();
+    let mut client = BuzzTestClient::connect(&url, &keys)
+        .await
+        .expect("authenticated client connect");
+
+    let template = TemplateRevision {
+        schema_version: PLAYBOOK_SCHEMA_VERSION,
+        template_id,
+        revision: 1,
+        name: "WebSocket retry regression".into(),
+        description: None,
+        status: TemplateStatus::Active,
+        sections: vec![PlaybookSection {
+            section_id,
+            title: "Launch".into(),
+            position: 1_000,
+            items: vec![PlaybookItem {
+                item_id,
+                text: "Verify transport".into(),
+                position: 1_000,
+                deleted: false,
+            }],
+            deleted: false,
+        }],
+    };
+    let template_event = EventBuilder::new(
+        Kind::Custom(KIND_PLAYBOOK_TEMPLATE_REVISION as u16),
+        serde_json::to_string(&template).expect("template JSON"),
+    )
+    .tags([Tag::parse(["template", &template_id.to_string()]).unwrap()])
+    .sign_with_keys(&keys)
+    .expect("sign template");
+    let template_ok = client
+        .send_event(template_event.clone())
+        .await
+        .expect("submit template");
+    assert_eq!(template_ok.event_id, template_event.id.to_hex());
+    assert!(template_ok.accepted, "template rejected: {template_ok:?}");
+
+    let insert = InstanceInsert {
+        schema_version: PLAYBOOK_SCHEMA_VERSION,
+        instance_id,
+        channel_id,
+        template_id,
+    };
+    let insert_event = EventBuilder::new(
+        Kind::Custom(KIND_PLAYBOOK_INSTANCE_INSERT as u16),
+        serde_json::to_string(&insert).expect("insert JSON"),
+    )
+    .tags([
+        Tag::parse(["h", &channel]).unwrap(),
+        Tag::parse(["instance", &instance_id.to_string()]).unwrap(),
+        Tag::parse(["template", &template_id.to_string()]).unwrap(),
+    ])
+    .sign_with_keys(&keys)
+    .expect("sign insert");
+    let insert_ok = client
+        .send_event(insert_event.clone())
+        .await
+        .expect("submit instance");
+    assert_eq!(insert_ok.event_id, insert_event.id.to_hex());
+    assert!(
+        insert_ok.accepted,
+        "instance insert rejected: {insert_ok:?}"
+    );
+
+    let live_sub = sub_id("playbook-semantic-retry-live");
+    let live_filter = Filter::new()
+        .kinds(vec![
+            Kind::Custom(KIND_PLAYBOOK_ITEM_ACTION as u16),
+            Kind::Custom(KIND_PLAYBOOK_STRUCTURE_OPERATION as u16),
+        ])
+        .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()]);
+    client
+        .subscribe(&live_sub, vec![live_filter])
+        .await
+        .expect("subscribe to command fanout");
+    let historical = client
+        .collect_until_eose(&live_sub, Duration::from_secs(5))
+        .await
+        .expect("command EOSE");
+    assert!(historical.is_empty());
+
+    let action = ItemAction {
+        schema_version: PLAYBOOK_SCHEMA_VERSION,
+        action_id: Uuid::new_v4(),
+        instance_id,
+        item_id,
+        action: ItemActionKind::Complete,
+        client_created_at: chrono::Utc::now(),
+    };
+    let action_content = serde_json::to_string(&action).expect("action JSON");
+    let action_tags = vec![
+        Tag::parse(["h", &channel]).unwrap(),
+        Tag::parse(["instance", &instance_id.to_string()]).unwrap(),
+    ];
+    let action_time = Timestamp::now();
+    let action_first = EventBuilder::new(
+        Kind::Custom(KIND_PLAYBOOK_ITEM_ACTION as u16),
+        action_content.clone(),
+    )
+    .tags(action_tags.clone())
+    .custom_created_at(action_time)
+    .sign_with_keys(&keys)
+    .expect("sign first action");
+    let action_retry = EventBuilder::new(
+        Kind::Custom(KIND_PLAYBOOK_ITEM_ACTION as u16),
+        action_content,
+    )
+    .tags(action_tags)
+    .custom_created_at(Timestamp::from(action_time.as_secs() + 1))
+    .sign_with_keys(&keys)
+    .expect("sign action retry");
+    assert_ne!(action_first.id, action_retry.id);
+
+    let action_first_ok = client
+        .send_event(action_first.clone())
+        .await
+        .expect("submit first action");
+    assert_eq!(action_first_ok.event_id, action_first.id.to_hex());
+    assert!(action_first_ok.accepted);
+    match client
+        .recv_event(Duration::from_secs(5))
+        .await
+        .expect("receive first action fanout")
+    {
+        RelayMessage::Event {
+            subscription_id,
+            event,
+        } => {
+            assert_eq!(subscription_id, live_sub);
+            assert_eq!(event.id, action_first.id);
+        }
+        other => panic!("expected first action fanout, got {other:?}"),
+    }
+
+    let action_retry_ok = client
+        .send_event(action_retry.clone())
+        .await
+        .expect("standard client must correlate action retry");
+    assert_eq!(action_retry_ok.event_id, action_retry.id.to_hex());
+    assert!(action_retry_ok.accepted);
+    assert_eq!(
+        action_retry_ok.message,
+        format!("duplicate: canonical_event_id={}", action_first.id.to_hex())
+    );
+    assert!(
+        matches!(
+            client.recv_event(Duration::from_millis(500)).await,
+            Err(TestClientError::Timeout)
+        ),
+        "semantic action retry emitted a second fanout"
+    );
+
+    let operation = StructureOperation {
+        schema_version: PLAYBOOK_SCHEMA_VERSION,
+        operation_id: Uuid::new_v4(),
+        instance_id,
+        base_structure_revision: 1,
+        operation: StructureOperationKind::ItemAdd {
+            section_id,
+            item: PlaybookItem {
+                item_id: Uuid::new_v4(),
+                text: "Confirm canonical acknowledgement".into(),
+                position: 2_000,
+                deleted: false,
+            },
+        },
+    };
+    let operation_content = serde_json::to_string(&operation).expect("operation JSON");
+    let operation_tags = vec![
+        Tag::parse(["h", &channel]).unwrap(),
+        Tag::parse(["instance", &instance_id.to_string()]).unwrap(),
+    ];
+    let operation_time = Timestamp::now();
+    let operation_first = EventBuilder::new(
+        Kind::Custom(KIND_PLAYBOOK_STRUCTURE_OPERATION as u16),
+        operation_content.clone(),
+    )
+    .tags(operation_tags.clone())
+    .custom_created_at(operation_time)
+    .sign_with_keys(&keys)
+    .expect("sign first operation");
+    let operation_retry = EventBuilder::new(
+        Kind::Custom(KIND_PLAYBOOK_STRUCTURE_OPERATION as u16),
+        operation_content,
+    )
+    .tags(operation_tags)
+    .custom_created_at(Timestamp::from(operation_time.as_secs() + 1))
+    .sign_with_keys(&keys)
+    .expect("sign operation retry");
+    assert_ne!(operation_first.id, operation_retry.id);
+
+    let operation_first_ok = client
+        .send_event(operation_first.clone())
+        .await
+        .expect("submit first operation");
+    assert_eq!(operation_first_ok.event_id, operation_first.id.to_hex());
+    assert!(operation_first_ok.accepted);
+    match client
+        .recv_event(Duration::from_secs(5))
+        .await
+        .expect("receive first operation fanout")
+    {
+        RelayMessage::Event {
+            subscription_id,
+            event,
+        } => {
+            assert_eq!(subscription_id, live_sub);
+            assert_eq!(event.id, operation_first.id);
+        }
+        other => panic!("expected first operation fanout, got {other:?}"),
+    }
+
+    let operation_retry_ok = client
+        .send_event(operation_retry.clone())
+        .await
+        .expect("standard client must correlate structure retry");
+    assert_eq!(operation_retry_ok.event_id, operation_retry.id.to_hex());
+    assert!(operation_retry_ok.accepted);
+    assert_eq!(
+        operation_retry_ok.message,
+        format!(
+            "duplicate: canonical_event_id={}",
+            operation_first.id.to_hex()
+        )
+    );
+    assert!(
+        matches!(
+            client.recv_event(Duration::from_millis(500)).await,
+            Err(TestClientError::Timeout)
+        ),
+        "semantic structure retry emitted a second fanout"
+    );
+
+    for (kind, canonical_event_id) in [
+        (KIND_PLAYBOOK_ITEM_ACTION, action_first.id),
+        (KIND_PLAYBOOK_STRUCTURE_OPERATION, operation_first.id),
+    ] {
+        let stored_sub = sub_id("playbook-semantic-retry-stored");
+        let filter = Filter::new()
+            .kind(Kind::Custom(kind as u16))
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()]);
+        client
+            .subscribe(&stored_sub, vec![filter])
+            .await
+            .expect("query stored command");
+        let stored = client
+            .collect_until_eose(&stored_sub, Duration::from_secs(5))
+            .await
+            .expect("stored command EOSE");
+        assert_eq!(stored.len(), 1, "semantic retry stored a second command");
+        assert_eq!(stored[0].id, canonical_event_id);
+    }
 }
 
 #[tokio::test]
