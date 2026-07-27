@@ -880,20 +880,40 @@ mod tests {
             .contains("for update"));
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
 
+        // Use-limited invite links: durable relay_invites table stores only
+        // the SHA-256 of an opaque v2 code, scoped by community_id. Never
+        // listed in _operator_global_tables — it is community-scoped.
         assert_eq!(migrations[24].version, 25);
-        let playbooks = migrations[24].sql.as_str();
+        let relay_invites = migrations[24].sql.as_str();
+        assert!(relay_invites.contains("CREATE TABLE relay_invites"));
+        assert!(relay_invites
+            .contains("token_hash   BYTEA       NOT NULL CHECK (length(token_hash) = 32)"));
+        assert!(relay_invites.contains("PRIMARY KEY (community_id, id)"));
+        assert!(relay_invites.contains("UNIQUE (community_id, token_hash)"));
+        assert!(
+            relay_invites.contains("max_uses     INTEGER     CHECK (max_uses BETWEEN 1 AND 10000)")
+        );
+        assert!(relay_invites.contains("CHECK (max_uses IS NULL OR use_count <= max_uses)"));
+        assert!(relay_invites.contains("role = 'member'"));
+        assert!(relay_invites
+            .contains("CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at)"));
+        assert!(!relay_invites.contains("_operator_global_tables"));
+
+        let desired_schema = include_str!("../../../schema/schema.sql");
+        assert!(
+            desired_schema.contains("CREATE TABLE join_policy_acceptances"),
+            "desired-state schema must include join-policy evidence used by invite claims",
+        );
+
+        assert_eq!(migrations[25].version, 26);
+        let playbooks = migrations[25].sql.as_str();
         assert!(playbooks.contains("CREATE TABLE playbook_templates"));
         assert!(playbooks.contains("CREATE TABLE playbook_instances"));
         assert!(playbooks.contains("CREATE TABLE playbook_item_actions"));
         assert!(playbooks.contains("CREATE TABLE playbook_structure_operations"));
         assert!(playbooks.contains("idx_playbook_instances_one_active_per_channel"));
+        assert!(playbooks.contains("command_payload JSONB NOT NULL"));
         assert!(!migrations[0].sql.as_str().contains("playbook_templates"));
-
-        assert_eq!(migrations[25].version, 26);
-        let semantic_idempotency = migrations[25].sql.as_str();
-        assert!(semantic_idempotency.contains("playbook_item_actions"));
-        assert!(semantic_idempotency.contains("playbook_structure_operations"));
-        assert!(semantic_idempotency.contains("command_payload"));
     }
 
     #[test]
@@ -1136,7 +1156,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(24));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(25));
     }
 
     #[tokio::test]
