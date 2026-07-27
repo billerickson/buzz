@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 
+import { relayClient } from "@/shared/api/relayClient";
 import {
   catalogPersonasFromPublications,
   catalogPublicationsFromEvents,
+  fetchPersonaCatalogPublications,
   personaEventIsShared,
 } from "./personaCatalogRelay.ts";
 
@@ -211,4 +213,196 @@ test("a pending local share does not appear before relay confirmation", () => {
 
   const personas = catalogPersonasFromPublications([], [localPersona], ALICE);
   assert.deepEqual(personas, []);
+});
+
+function localPersona(overrides = {}) {
+  return {
+    id: "local-1",
+    displayName: "Relay Reviewer",
+    avatarUrl: null,
+    systemPrompt: "Review changes.",
+    runtime: null,
+    model: null,
+    provider: null,
+    namePool: [],
+    isBuiltIn: false,
+    isActive: true,
+    shared: false,
+    sourceTeam: null,
+    catalogSource: null,
+    envVars: {},
+    respondTo: null,
+    respondToAllowlist: [],
+    parallelism: null,
+    createdAt: "2026-07-26T00:00:00.000Z",
+    updatedAt: "2026-07-26T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+// The duplicate-add bug: a copy of Alice's entry carries a fresh local UUID, so
+// matching by id finds nothing and the catalog offers "Add" again. Only the
+// stored catalogSource coordinate links the copy back to the publication.
+test("test_added_foreign_catalog_entry_resolves_to_its_local_copy", () => {
+  const publications = catalogPublicationsFromEvents([
+    personaEvent({ createdAt: 1, id: "alice-reviewer" }),
+  ]);
+  const copy = localPersona({
+    id: "a-fresh-uuid",
+    catalogSource: { ownerPubkey: ALICE, personaId: "reviewer" },
+  });
+
+  const personas = catalogPersonasFromPublications(publications, [copy], BOB);
+
+  assert.equal(personas.length, 1);
+  assert.equal(
+    personas[0].id,
+    "a-fresh-uuid",
+    "the projection must resolve to the existing local copy, not a synthetic id",
+  );
+  assert.equal(
+    personas[0].isActive,
+    true,
+    "an added foreign entry must read as already selected",
+  );
+});
+
+test("test_foreign_entry_with_no_local_copy_stays_unselected", () => {
+  const publications = catalogPublicationsFromEvents([
+    personaEvent({ createdAt: 1, id: "alice-reviewer" }),
+  ]);
+  // A same-named local persona with no provenance is a different agent.
+  const unrelated = localPersona({ id: "unrelated" });
+
+  const personas = catalogPersonasFromPublications(
+    publications,
+    [unrelated],
+    BOB,
+  );
+
+  assert.equal(personas[0].id, "catalog:" + ALICE + ":reviewer");
+  assert.equal(personas[0].isActive, false);
+});
+
+// Provenance is per-owner: the same d-tag under a different publisher is a
+// different agent, so a copy of Alice's must not mask Bob's entry.
+test("test_catalog_source_match_is_scoped_to_the_publishing_owner", () => {
+  const publications = catalogPublicationsFromEvents([
+    personaEvent({ createdAt: 1, id: "bob-reviewer", owner: BOB }),
+  ]);
+  const copyOfAlices = localPersona({
+    id: "copy-of-alices",
+    catalogSource: { ownerPubkey: ALICE, personaId: "reviewer" },
+  });
+
+  const personas = catalogPersonasFromPublications(
+    publications,
+    [copyOfAlices],
+    ALICE,
+  );
+
+  assert.equal(personas[0].id, "catalog:" + BOB + ":reviewer");
+  assert.equal(personas[0].isActive, false);
+});
+
+test("test_own_publication_still_resolves_by_local_id", () => {
+  const publications = catalogPublicationsFromEvents([
+    personaEvent({ createdAt: 1, id: "alice-reviewer" }),
+  ]);
+  const own = localPersona({ id: "reviewer", shared: true });
+
+  const personas = catalogPersonasFromPublications(publications, [own], ALICE);
+
+  assert.equal(personas[0].id, "reviewer");
+  assert.equal(personas[0].catalogSource.isOwn, true);
+});
+
+function pageOfEvents(count, startId, createdAt) {
+  return Array.from({ length: count }, (_, index) =>
+    personaEvent({
+      createdAt: typeof createdAt === "function" ? createdAt(index) : createdAt,
+      id: `event-${startId + index}`,
+      sourcePersonaId: `persona-${startId + index}`,
+    }),
+  );
+}
+
+function stubPagedRelay(pages) {
+  const filters = [];
+  mock.method(relayClient, "fetchEvents", (filter) => {
+    filters.push(filter);
+    return Promise.resolve(pages[filters.length - 1] ?? []);
+  });
+  return filters;
+}
+
+// A single limit-capped fetch drops every entry past the relay's clamp, making
+// those agents undiscoverable. The walk must keep going while pages come back
+// full, and must carry an `until` cursor derived from the oldest event seen.
+test("test_full_page_is_followed_by_a_cursored_request_for_older_events", async (t) => {
+  t.after(() => mock.restoreAll());
+  const filters = stubPagedRelay([
+    pageOfEvents(500, 0, (index) => 10_000 - index),
+    pageOfEvents(3, 500, 9_000),
+  ]);
+
+  const publications = await fetchPersonaCatalogPublications();
+
+  assert.equal(filters.length, 2, "a full page must be followed by another");
+  assert.equal(filters[0].until, undefined, "the first page has no cursor");
+  assert.equal(
+    filters[1].until,
+    10_000 - 499,
+    "the cursor must be the oldest created_at from the previous page",
+  );
+  assert.equal(
+    publications.length,
+    503,
+    "entries past the first page must still be discoverable",
+  );
+});
+
+test("test_short_first_page_does_not_issue_a_second_request", async (t) => {
+  t.after(() => mock.restoreAll());
+  const filters = stubPagedRelay([pageOfEvents(2, 0, 10_000)]);
+
+  const publications = await fetchPersonaCatalogPublications();
+
+  assert.equal(filters.length, 1);
+  assert.equal(publications.length, 2);
+});
+
+// `until` is inclusive on the relay, so consecutive pages overlap on the
+// boundary timestamp. Without id dedupe the repeats would be counted twice.
+test("test_overlapping_pages_are_deduped_by_event_id", async (t) => {
+  t.after(() => mock.restoreAll());
+  const firstPage = pageOfEvents(500, 0, (index) => 10_000 - index);
+  const secondPage = [
+    // The boundary event repeats because `until` includes its timestamp.
+    firstPage[firstPage.length - 1],
+    ...pageOfEvents(2, 500, 9_000),
+  ];
+  stubPagedRelay([firstPage, secondPage]);
+
+  const publications = await fetchPersonaCatalogPublications();
+
+  assert.equal(publications.length, 502, "the repeated event must count once");
+});
+
+// The stop-on-no-progress guard: a full page whose events all share one
+// created_at cannot advance the cursor, so paging must terminate instead of
+// re-requesting the same page forever.
+test("test_full_page_of_tied_timestamps_terminates_the_walk", async (t) => {
+  t.after(() => mock.restoreAll());
+  const tiedPage = pageOfEvents(500, 0, 10_000);
+  const filters = stubPagedRelay([tiedPage, tiedPage, tiedPage, tiedPage]);
+
+  const publications = await fetchPersonaCatalogPublications();
+
+  assert.equal(
+    filters.length,
+    2,
+    "the walk must stop once a page contributes nothing new",
+  );
+  assert.equal(publications.length, 500);
 });
