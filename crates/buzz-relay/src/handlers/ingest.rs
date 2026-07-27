@@ -27,7 +27,9 @@ use buzz_core::kind::{
     KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
     KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
     KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
-    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
+    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PLAYBOOK_INSTANCE_INSERT,
+    KIND_PLAYBOOK_INSTANCE_SNAPSHOT, KIND_PLAYBOOK_ITEM_ACTION, KIND_PLAYBOOK_STRUCTURE_OPERATION,
+    KIND_PLAYBOOK_TEMPLATE_REVISION, KIND_PLAYBOOK_TEMPLATE_SNAPSHOT, KIND_PRESENCE_UPDATE,
     KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_REACTION, KIND_READ_STATE, KIND_REPORT,
     KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
     KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
@@ -214,6 +216,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_TEXT_NOTE | KIND_LONG_FORM => Ok(Scope::MessagesWrite),
         KIND_CONTACT_LIST | KIND_READ_STATE | KIND_USER_STATUS | KIND_AGENT_ENGRAM
         | KIND_EVENT_REMINDER | KIND_PERSONA | KIND_TEAM | KIND_MANAGED_AGENT
+        | KIND_PLAYBOOK_TEMPLATE_REVISION
         | super::push_lease::KIND_PUSH_LEASE => {
             Ok(Scope::UsersWrite)
         }
@@ -255,7 +258,10 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_STREAM_MESSAGE_DIFF
         | KIND_FORUM_POST
         | KIND_FORUM_VOTE
-        | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
+        | KIND_FORUM_COMMENT
+        | KIND_PLAYBOOK_INSTANCE_INSERT
+        | KIND_PLAYBOOK_ITEM_ACTION
+        | KIND_PLAYBOOK_STRUCTURE_OPERATION => Ok(Scope::MessagesWrite),
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
             Ok(Scope::AdminChannels)
         }
@@ -423,6 +429,8 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // keyed by (pubkey, kind, d_tag). A stray `h` tag must not channel-scope them.
             | KIND_TEAM
             | KIND_MANAGED_AGENT
+            | KIND_PLAYBOOK_TEMPLATE_REVISION
+            | KIND_PLAYBOOK_TEMPLATE_SNAPSHOT
             // NIP-34: git events use `a` tags (repo reference), not `h` tags (channel scope).
             // Parameterized replaceable kinds are keyed by (pubkey, kind, d_tag).
             | KIND_GIT_REPO_ANNOUNCEMENT
@@ -480,6 +488,10 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_FORUM_POST
             | KIND_FORUM_VOTE
             | KIND_FORUM_COMMENT
+            | KIND_PLAYBOOK_INSTANCE_INSERT
+            | KIND_PLAYBOOK_INSTANCE_SNAPSHOT
+            | KIND_PLAYBOOK_ITEM_ACTION
+            | KIND_PLAYBOOK_STRUCTURE_OPERATION
             // NIP-29 admin kinds (except CREATE_GROUP which creates the channel)
             | KIND_NIP29_PUT_USER
             | KIND_NIP29_REMOVE_USER
@@ -2912,6 +2924,10 @@ mod tests {
             KIND_TEAM,
             KIND_MANAGED_AGENT,
             KIND_AGENT_TURN_METRIC,
+            KIND_PLAYBOOK_TEMPLATE_REVISION,
+            KIND_PLAYBOOK_INSTANCE_INSERT,
+            KIND_PLAYBOOK_ITEM_ACTION,
+            KIND_PLAYBOOK_STRUCTURE_OPERATION,
         ];
         for kind in migrated {
             assert!(
@@ -2919,6 +2935,32 @@ mod tests {
                 "kind {kind} should be in the allowlist"
             );
         }
+    }
+
+    #[test]
+    fn playbook_kinds_have_expected_scope_and_visibility() {
+        let dummy = make_dummy_event();
+        assert_eq!(
+            required_scope_for_kind(KIND_PLAYBOOK_TEMPLATE_REVISION, &dummy).unwrap(),
+            Scope::UsersWrite
+        );
+        assert!(is_global_only_kind(KIND_PLAYBOOK_TEMPLATE_REVISION));
+        assert!(is_global_only_kind(KIND_PLAYBOOK_TEMPLATE_SNAPSHOT));
+        assert!(!requires_h_channel_scope(KIND_PLAYBOOK_TEMPLATE_REVISION));
+
+        for kind in [
+            KIND_PLAYBOOK_INSTANCE_INSERT,
+            KIND_PLAYBOOK_ITEM_ACTION,
+            KIND_PLAYBOOK_STRUCTURE_OPERATION,
+        ] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).unwrap(),
+                Scope::MessagesWrite
+            );
+            assert!(requires_h_channel_scope(kind));
+            assert!(!is_global_only_kind(kind));
+        }
+        assert!(requires_h_channel_scope(KIND_PLAYBOOK_INSTANCE_SNAPSHOT));
     }
 
     #[test]

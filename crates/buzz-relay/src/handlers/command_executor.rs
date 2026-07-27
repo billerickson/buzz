@@ -1,6 +1,6 @@
 //! Command executor — transactional event processing for command kinds.
 //!
-//! Command kinds (41010–41012, 30620, 46020, 46030–46031) are processed
+//! Command kinds (40200–40203, 41010–41012, 30620, 46020, 46030–46031) are processed
 //! transactionally: validate → begin tx → insert event → execute mutations → commit.
 //!
 //! SECURITY: This module is only reachable AFTER the ingest pipeline has verified:
@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use nostr::Event;
+use nostr::{Event, EventBuilder, Kind, Tag};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
@@ -69,10 +69,530 @@ pub async fn handle_command(
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
         KIND_APPROVAL_DENY => handle_approval_deny(tenant, state, &event, &auth).await,
+        KIND_PLAYBOOK_TEMPLATE_REVISION => {
+            handle_playbook_template_revision(tenant, state, &event).await
+        }
+        KIND_PLAYBOOK_INSTANCE_INSERT => {
+            handle_playbook_instance_insert(tenant, state, &event).await
+        }
+        KIND_PLAYBOOK_ITEM_ACTION => handle_playbook_item_action(tenant, state, &event).await,
+        KIND_PLAYBOOK_STRUCTURE_OPERATION => {
+            handle_playbook_structure_operation(tenant, state, &event).await
+        }
         _ => Err(IngestError::Rejected(format!(
             "unknown command kind: {kind}"
         ))),
     }
+}
+
+fn map_playbook_db_error(error: buzz_db::DbError) -> IngestError {
+    match error {
+        buzz_db::DbError::AccessDenied(message) => IngestError::AuthFailed(message),
+        buzz_db::DbError::Conflict(message) => {
+            IngestError::Rejected(format!("conflict: {message}"))
+        }
+        buzz_db::DbError::NotFound(message) | buzz_db::DbError::InvalidData(message) => {
+            IngestError::Rejected(format!("invalid: {message}"))
+        }
+        buzz_db::DbError::ChannelNotFound(channel_id) => {
+            IngestError::Rejected(format!("invalid: channel not found: {channel_id}"))
+        }
+        other => IngestError::Internal(format!("error: playbook database: {other}")),
+    }
+}
+
+fn exact_tag(event: &Event, name: &str) -> Result<Option<String>, IngestError> {
+    let mut values = event.tags.iter().filter_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.len() == 2 && parts[0].as_str() == name).then(|| parts[1].to_string())
+    });
+    let value = values.next();
+    if values.next().is_some()
+        || event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            !parts.is_empty() && parts[0].as_str() == name && parts.len() != 2
+        })
+    {
+        return Err(IngestError::Rejected(format!(
+            "invalid: expected at most one exact {name} tag"
+        )));
+    }
+    Ok(value)
+}
+
+async fn dispatch_playbook_command(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    channel_id: Option<Uuid>,
+) {
+    let stored =
+        buzz_core::StoredEvent::with_received_at(event.clone(), Utc::now(), channel_id, true);
+    super::event::dispatch_persistent_event(
+        tenant,
+        state,
+        &stored,
+        event.kind.as_u16() as u32,
+        &event.pubkey.to_hex(),
+        None,
+    )
+    .await;
+}
+
+async fn publish_playbook_template_snapshot(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    snapshot: &buzz_core::playbook::TemplateSnapshot,
+) -> Result<(), IngestError> {
+    let template_id = snapshot.template.template_id.to_string();
+    let tags = vec![
+        Tag::parse(["d", template_id.as_str()])
+            .map_err(|error| IngestError::Internal(format!("error: d tag: {error}")))?,
+        Tag::parse(["template", template_id.as_str()])
+            .map_err(|error| IngestError::Internal(format!("error: template tag: {error}")))?,
+    ];
+    let content = serde_json::to_string(snapshot)
+        .map_err(|error| IngestError::Internal(format!("error: snapshot JSON: {error}")))?;
+    if playbook_snapshot_is_current(
+        tenant,
+        state,
+        KIND_PLAYBOOK_TEMPLATE_SNAPSHOT,
+        &template_id,
+        None,
+        &content,
+    )
+    .await
+    {
+        return Ok(());
+    }
+    let created_at = next_playbook_snapshot_timestamp(
+        tenant,
+        state,
+        KIND_PLAYBOOK_TEMPLATE_SNAPSHOT,
+        &template_id,
+        None,
+    )
+    .await;
+    let event = EventBuilder::new(
+        Kind::Custom(KIND_PLAYBOOK_TEMPLATE_SNAPSHOT as u16),
+        content,
+    )
+    .tags(tags)
+    .custom_created_at(nostr::Timestamp::from(created_at))
+    .sign_with_keys(&state.relay_keypair)
+    .map_err(|error| IngestError::Internal(format!("error: sign snapshot: {error}")))?;
+    let (stored, inserted) = state
+        .db
+        .replace_parameterized_event(tenant.community(), &event, &template_id, None)
+        .await
+        .map_err(|error| IngestError::Internal(format!("error: store snapshot: {error}")))?;
+    if inserted {
+        super::event::dispatch_persistent_event(
+            tenant,
+            state,
+            &stored,
+            KIND_PLAYBOOK_TEMPLATE_SNAPSHOT,
+            &state.relay_keypair.public_key().to_hex(),
+            None,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn publish_playbook_instance_snapshot(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    snapshot: &buzz_core::playbook::InstanceSnapshot,
+) -> Result<(), IngestError> {
+    let instance_id = snapshot.instance.instance_id.to_string();
+    let channel_id = snapshot.instance.channel_id.to_string();
+    let template_id = snapshot.instance.source_template_id.to_string();
+    let tags = vec![
+        Tag::parse(["d", instance_id.as_str()])
+            .map_err(|error| IngestError::Internal(format!("error: d tag: {error}")))?,
+        Tag::parse(["h", channel_id.as_str()])
+            .map_err(|error| IngestError::Internal(format!("error: h tag: {error}")))?,
+        Tag::parse(["instance", instance_id.as_str()])
+            .map_err(|error| IngestError::Internal(format!("error: instance tag: {error}")))?,
+        Tag::parse(["template", template_id.as_str()])
+            .map_err(|error| IngestError::Internal(format!("error: template tag: {error}")))?,
+    ];
+    let content = serde_json::to_string(snapshot)
+        .map_err(|error| IngestError::Internal(format!("error: snapshot JSON: {error}")))?;
+    if playbook_snapshot_is_current(
+        tenant,
+        state,
+        KIND_PLAYBOOK_INSTANCE_SNAPSHOT,
+        &instance_id,
+        Some(snapshot.instance.channel_id),
+        &content,
+    )
+    .await
+    {
+        return Ok(());
+    }
+    let created_at = next_playbook_snapshot_timestamp(
+        tenant,
+        state,
+        KIND_PLAYBOOK_INSTANCE_SNAPSHOT,
+        &instance_id,
+        Some(snapshot.instance.channel_id),
+    )
+    .await;
+    let event = EventBuilder::new(
+        Kind::Custom(KIND_PLAYBOOK_INSTANCE_SNAPSHOT as u16),
+        content,
+    )
+    .tags(tags)
+    .custom_created_at(nostr::Timestamp::from(created_at))
+    .sign_with_keys(&state.relay_keypair)
+    .map_err(|error| IngestError::Internal(format!("error: sign snapshot: {error}")))?;
+    let (stored, inserted) = state
+        .db
+        .replace_parameterized_event(
+            tenant.community(),
+            &event,
+            &instance_id,
+            Some(snapshot.instance.channel_id),
+        )
+        .await
+        .map_err(|error| IngestError::Internal(format!("error: store snapshot: {error}")))?;
+    if inserted {
+        super::event::dispatch_persistent_event(
+            tenant,
+            state,
+            &stored,
+            KIND_PLAYBOOK_INSTANCE_SNAPSHOT,
+            &state.relay_keypair.public_key().to_hex(),
+            None,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn playbook_snapshot_is_current(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    kind: u32,
+    d_tag: &str,
+    channel_id: Option<Uuid>,
+    expected_content: &str,
+) -> bool {
+    state
+        .db
+        .query_events(&buzz_db::event::EventQuery {
+            kinds: Some(vec![kind as i32]),
+            pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+            d_tag: Some(d_tag.to_owned()),
+            channel_id,
+            limit: Some(1),
+            ..buzz_db::event::EventQuery::for_community(tenant.community())
+        })
+        .await
+        .ok()
+        .and_then(|events| events.into_iter().next())
+        .is_some_and(|stored| stored.event.content == expected_content)
+}
+
+async fn next_playbook_snapshot_timestamp(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    kind: u32,
+    d_tag: &str,
+    channel_id: Option<Uuid>,
+) -> u64 {
+    let now = Utc::now().timestamp().max(0) as u64;
+    let existing = state
+        .db
+        .query_events(&buzz_db::event::EventQuery {
+            kinds: Some(vec![kind as i32]),
+            pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+            d_tag: Some(d_tag.to_owned()),
+            channel_id,
+            limit: Some(1),
+            ..buzz_db::event::EventQuery::for_community(tenant.community())
+        })
+        .await
+        .unwrap_or_default();
+    existing
+        .first()
+        .map(|event| event.event.created_at.as_secs() + 1)
+        .unwrap_or(now)
+        .max(now)
+}
+
+async fn handle_playbook_template_revision(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+) -> Result<IngestResult, IngestError> {
+    if exact_tag(event, "h")?.is_some() {
+        return Err(IngestError::Rejected(
+            "invalid: template revisions are community-global".into(),
+        ));
+    }
+    let revision: buzz_core::playbook::TemplateRevision = serde_json::from_str(&event.content)
+        .map_err(|error| IngestError::Rejected(format!("invalid: template JSON: {error}")))?;
+    let template_tag = exact_tag(event, "template")?
+        .ok_or_else(|| IngestError::Rejected("invalid: missing template tag".into()))?;
+    if template_tag != revision.template_id.to_string() {
+        return Err(IngestError::Rejected(
+            "invalid: template tag does not match payload".into(),
+        ));
+    }
+    let tx = match persist_command_event(state, tenant, event, None).await? {
+        PersistResult::Duplicate => {
+            let snapshot = state
+                .db
+                .playbook_template_snapshot(tenant.community(), revision.template_id)
+                .await
+                .map_err(map_playbook_db_error)?;
+            publish_playbook_template_snapshot(tenant, state, &snapshot).await?;
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: format!(
+                    "response:{}",
+                    serde_json::to_string(&snapshot).unwrap_or_default()
+                ),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+    let snapshot = state
+        .db
+        .apply_playbook_template_revision(
+            tenant.community(),
+            &revision,
+            event.id.as_bytes(),
+            &event.pubkey.to_bytes(),
+        )
+        .await
+        .map_err(map_playbook_db_error)?;
+    tx.commit()
+        .await
+        .map_err(|error| IngestError::Internal(format!("error: commit: {error}")))?;
+    dispatch_playbook_command(tenant, state, event, None).await;
+    publish_playbook_template_snapshot(tenant, state, &snapshot).await?;
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::to_string(&snapshot).unwrap_or_default()
+        ),
+    })
+}
+
+fn playbook_channel_id(event: &Event) -> Result<Uuid, IngestError> {
+    let channel = exact_tag(event, "h")?
+        .ok_or_else(|| IngestError::Rejected("invalid: missing h tag".into()))?;
+    Uuid::parse_str(&channel).map_err(|_| IngestError::Rejected("invalid: malformed h tag".into()))
+}
+
+async fn handle_playbook_instance_insert(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+) -> Result<IngestResult, IngestError> {
+    let channel_id = playbook_channel_id(event)?;
+    let request: buzz_core::playbook::InstanceInsert = serde_json::from_str(&event.content)
+        .map_err(|error| IngestError::Rejected(format!("invalid: insert JSON: {error}")))?;
+    if channel_id != request.channel_id {
+        return Err(IngestError::Rejected(
+            "invalid: h tag does not match channel_id".into(),
+        ));
+    }
+    let instance_tag = exact_tag(event, "instance")?
+        .ok_or_else(|| IngestError::Rejected("invalid: missing instance tag".into()))?;
+    let template_tag = exact_tag(event, "template")?
+        .ok_or_else(|| IngestError::Rejected("invalid: missing template tag".into()))?;
+    if instance_tag != request.instance_id.to_string()
+        || template_tag != request.template_id.to_string()
+    {
+        return Err(IngestError::Rejected(
+            "invalid: instance/template tag does not match payload".into(),
+        ));
+    }
+    let tx = match persist_command_event(state, tenant, event, Some(channel_id)).await? {
+        PersistResult::Duplicate => {
+            let snapshot = state
+                .db
+                .playbook_instance_snapshot(tenant.community(), request.instance_id)
+                .await
+                .map_err(map_playbook_db_error)?;
+            publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: format!(
+                    "response:{}",
+                    serde_json::to_string(&snapshot).unwrap_or_default()
+                ),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+    let snapshot = state
+        .db
+        .insert_playbook_instance(
+            tenant.community(),
+            &request,
+            event.id.as_bytes(),
+            &event.pubkey.to_bytes(),
+        )
+        .await
+        .map_err(map_playbook_db_error)?;
+    tx.commit()
+        .await
+        .map_err(|error| IngestError::Internal(format!("error: commit: {error}")))?;
+    dispatch_playbook_command(tenant, state, event, Some(channel_id)).await;
+    publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+    if let Err(error) = emit_system_message(
+        tenant,
+        state,
+        channel_id,
+        serde_json::json!({
+            "type": "playbook_added",
+            "instance_id": request.instance_id,
+            "template_id": request.template_id,
+        }),
+    )
+    .await
+    {
+        warn!(%error, "playbook insert system message failed");
+    }
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::to_string(&snapshot).unwrap_or_default()
+        ),
+    })
+}
+
+async fn handle_playbook_item_action(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+) -> Result<IngestResult, IngestError> {
+    let channel_id = playbook_channel_id(event)?;
+    let action: buzz_core::playbook::ItemAction = serde_json::from_str(&event.content)
+        .map_err(|error| IngestError::Rejected(format!("invalid: action JSON: {error}")))?;
+    let instance_tag = exact_tag(event, "instance")?
+        .ok_or_else(|| IngestError::Rejected("invalid: missing instance tag".into()))?;
+    if instance_tag != action.instance_id.to_string() {
+        return Err(IngestError::Rejected(
+            "invalid: instance tag does not match payload".into(),
+        ));
+    }
+    let tx = match persist_command_event(state, tenant, event, Some(channel_id)).await? {
+        PersistResult::Duplicate => {
+            let snapshot = state
+                .db
+                .playbook_instance_snapshot(tenant.community(), action.instance_id)
+                .await
+                .map_err(map_playbook_db_error)?;
+            publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: format!(
+                    "response:{}",
+                    serde_json::to_string(&snapshot).unwrap_or_default()
+                ),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+    let snapshot = state
+        .db
+        .apply_playbook_item_action(
+            tenant.community(),
+            channel_id,
+            &action,
+            event.id.as_bytes(),
+            &event.pubkey.to_bytes(),
+        )
+        .await
+        .map_err(map_playbook_db_error)?;
+    tx.commit()
+        .await
+        .map_err(|error| IngestError::Internal(format!("error: commit: {error}")))?;
+    dispatch_playbook_command(tenant, state, event, Some(channel_id)).await;
+    publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::to_string(&snapshot).unwrap_or_default()
+        ),
+    })
+}
+
+async fn handle_playbook_structure_operation(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+) -> Result<IngestResult, IngestError> {
+    let channel_id = playbook_channel_id(event)?;
+    let operation: buzz_core::playbook::StructureOperation =
+        serde_json::from_str(&event.content)
+            .map_err(|error| IngestError::Rejected(format!("invalid: operation JSON: {error}")))?;
+    let instance_tag = exact_tag(event, "instance")?
+        .ok_or_else(|| IngestError::Rejected("invalid: missing instance tag".into()))?;
+    if instance_tag != operation.instance_id.to_string() {
+        return Err(IngestError::Rejected(
+            "invalid: instance tag does not match payload".into(),
+        ));
+    }
+    let tx = match persist_command_event(state, tenant, event, Some(channel_id)).await? {
+        PersistResult::Duplicate => {
+            let snapshot = state
+                .db
+                .playbook_instance_snapshot(tenant.community(), operation.instance_id)
+                .await
+                .map_err(map_playbook_db_error)?;
+            publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: format!(
+                    "response:{}",
+                    serde_json::to_string(&snapshot).unwrap_or_default()
+                ),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+    let snapshot = state
+        .db
+        .apply_playbook_structure_operation(
+            tenant.community(),
+            channel_id,
+            &operation,
+            event.id.as_bytes(),
+            &event.pubkey.to_bytes(),
+        )
+        .await
+        .map_err(map_playbook_db_error)?;
+    tx.commit()
+        .await
+        .map_err(|error| IngestError::Internal(format!("error: commit: {error}")))?;
+    dispatch_playbook_command(tenant, state, event, Some(channel_id)).await;
+    publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::to_string(&snapshot).unwrap_or_default()
+        ),
+    })
 }
 
 /// Result of persisting a command event: either a duplicate (already processed)
@@ -1367,4 +1887,44 @@ async fn resume_workflow_after_approval(
     engine
         .finalize_run(community_id, run_id, result, existing_trace)
         .await;
+}
+
+#[cfg(test)]
+mod playbook_tests {
+    use super::*;
+    use nostr::Keys;
+
+    fn event(tags: Vec<Tag>) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_PLAYBOOK_ITEM_ACTION as u16), "{}")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    #[test]
+    fn exact_playbook_tags_reject_duplicates_and_malformed_shapes() {
+        let duplicate = event(vec![
+            Tag::parse(["instance", Uuid::new_v4().to_string().as_str()]).unwrap(),
+            Tag::parse(["instance", Uuid::new_v4().to_string().as_str()]).unwrap(),
+        ]);
+        assert!(matches!(
+            exact_tag(&duplicate, "instance"),
+            Err(IngestError::Rejected(_))
+        ));
+
+        let malformed = event(vec![Tag::parse(["instance"]).unwrap()]);
+        assert!(matches!(
+            exact_tag(&malformed, "instance"),
+            Err(IngestError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn playbook_conflicts_have_stable_bridge_prefix() {
+        let error = map_playbook_db_error(DbError::Conflict("stale revision".into()));
+        assert!(matches!(
+            error,
+            IngestError::Rejected(message) if message == "conflict: stale revision"
+        ));
+    }
 }

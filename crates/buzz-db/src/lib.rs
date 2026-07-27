@@ -33,6 +33,8 @@ pub mod migration;
 pub mod moderation;
 /// Monthly table partition management.
 pub mod partition;
+/// Native Playbooks materialized projections and atomic mutation helpers.
+pub mod playbook;
 /// Buzz product-feedback sidecar persistence.
 pub mod product_feedback;
 /// Community-scoped push lease and durable wake-outbox persistence.
@@ -647,6 +649,86 @@ impl Db {
     /// The transaction holds an owned pool handle, not a borrow.
     pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
         self.pool.begin().await.map_err(Into::into)
+    }
+
+    /// Apply an immutable template revision and return the current projection.
+    pub async fn apply_playbook_template_revision(
+        &self,
+        community_id: CommunityId,
+        revision: &buzz_core::playbook::TemplateRevision,
+        event_id: &[u8],
+        actor: &[u8],
+    ) -> Result<buzz_core::playbook::TemplateSnapshot> {
+        playbook::apply_template_revision(&self.pool, community_id, revision, event_id, actor).await
+    }
+
+    /// Deep-copy an active template into a channel.
+    pub async fn insert_playbook_instance(
+        &self,
+        community_id: CommunityId,
+        request: &buzz_core::playbook::InstanceInsert,
+        event_id: &[u8],
+        actor: &[u8],
+    ) -> Result<buzz_core::playbook::InstanceSnapshot> {
+        playbook::insert_instance(&self.pool, community_id, request, event_id, actor).await
+    }
+
+    /// Apply an idempotent playbook item action.
+    pub async fn apply_playbook_item_action(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        action: &buzz_core::playbook::ItemAction,
+        event_id: &[u8],
+        actor: &[u8],
+    ) -> Result<buzz_core::playbook::InstanceSnapshot> {
+        playbook::apply_item_action(
+            &self.pool,
+            community_id,
+            channel_id,
+            action,
+            event_id,
+            actor,
+        )
+        .await
+    }
+
+    /// Apply an idempotent optimistic-concurrency structural operation.
+    pub async fn apply_playbook_structure_operation(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        operation: &buzz_core::playbook::StructureOperation,
+        event_id: &[u8],
+        actor: &[u8],
+    ) -> Result<buzz_core::playbook::InstanceSnapshot> {
+        playbook::apply_structure_operation(
+            &self.pool,
+            community_id,
+            channel_id,
+            operation,
+            event_id,
+            actor,
+        )
+        .await
+    }
+
+    /// Read the current template projection.
+    pub async fn playbook_template_snapshot(
+        &self,
+        community_id: CommunityId,
+        template_id: Uuid,
+    ) -> Result<buzz_core::playbook::TemplateSnapshot> {
+        playbook::template_snapshot(&self.pool, community_id, template_id).await
+    }
+
+    /// Read the current instance projection and complete activity.
+    pub async fn playbook_instance_snapshot(
+        &self,
+        community_id: CommunityId,
+        instance_id: Uuid,
+    ) -> Result<buzz_core::playbook::InstanceSnapshot> {
+        playbook::instance_snapshot(&self.pool, community_id, instance_id).await
     }
 
     /// Returns the community mapped to a normalized request host, if one exists.

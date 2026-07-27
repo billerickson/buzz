@@ -849,10 +849,15 @@ async fn submit_event_authed(
             // in the HTTP response body (unchanged from prior behaviour).
             let reason = truncate_reason(&msg, REJECT_REASON_MAX_BYTES).to_owned();
             crate::handlers::ingest::reject_with_transport("http", "invalid");
+            let status = if msg.starts_with("conflict:") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
             SubmitOutcome::Rejected {
                 kind: kind_u32,
                 reason,
-                response: api_error(StatusCode::BAD_REQUEST, &msg),
+                response: api_error(status, &msg),
             }
         }
         Err(IngestError::AuthFailed(msg)) => {

@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 24);
+        assert_eq!(migrations.len(), 25);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -879,6 +879,15 @@ mod tests {
             .to_lowercase()
             .contains("for update"));
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
+
+        assert_eq!(migrations[24].version, 25);
+        let playbooks = migrations[24].sql.as_str();
+        assert!(playbooks.contains("CREATE TABLE playbook_templates"));
+        assert!(playbooks.contains("CREATE TABLE playbook_instances"));
+        assert!(playbooks.contains("CREATE TABLE playbook_item_actions"));
+        assert!(playbooks.contains("CREATE TABLE playbook_structure_operations"));
+        assert!(playbooks.contains("idx_playbook_instances_one_active_per_channel"));
+        assert!(!migrations[0].sql.as_str().contains("playbook_templates"));
     }
 
     #[test]

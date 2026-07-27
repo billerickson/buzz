@@ -11,6 +11,7 @@ pub mod moderation;
 pub mod notes;
 pub mod pack;
 pub mod patches;
+pub mod playbooks;
 pub mod pr;
 pub mod reactions;
 pub mod repos;

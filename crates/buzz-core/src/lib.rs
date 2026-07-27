@@ -28,6 +28,8 @@ pub mod network;
 pub mod observer;
 /// NIP-AB device pairing — crypto primitives, message types, and errors.
 pub mod pairing;
+/// Native channel playbook payloads, validation, and projection helpers.
+pub mod playbook;
 /// Presence status types shared across crates.
 pub mod presence;
 /// Canonical relay runtime identities.

@@ -236,6 +236,91 @@ enum Cmd {
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+    /// Create and operate reusable channel playbooks
+    #[command(subcommand)]
+    Playbooks(PlaybooksCmd),
+}
+
+#[derive(Subcommand)]
+pub enum PlaybooksCmd {
+    /// Manage community-wide playbook templates
+    #[command(subcommand)]
+    Templates(PlaybookTemplatesCmd),
+    /// Insert the latest active template revision into a channel
+    Insert {
+        /// Target channel UUID
+        #[arg(long)]
+        channel: Uuid,
+        /// Source template UUID
+        #[arg(long)]
+        template: Uuid,
+    },
+    /// Get a materialized channel playbook instance
+    Get {
+        /// Instance UUID
+        #[arg(long)]
+        instance: Uuid,
+    },
+    /// Complete an item
+    Check {
+        /// Instance UUID
+        #[arg(long)]
+        instance: Uuid,
+        /// Item UUID
+        #[arg(long)]
+        item: Uuid,
+    },
+    /// Reopen an item
+    Reopen {
+        /// Instance UUID
+        #[arg(long)]
+        instance: Uuid,
+        /// Item UUID
+        #[arg(long)]
+        item: Uuid,
+    },
+    /// Apply a structural operation from JSON
+    Edit {
+        /// Instance UUID
+        #[arg(long)]
+        instance: Uuid,
+        /// JSON file containing a StructureOperation payload
+        #[arg(long)]
+        operation_file: String,
+    },
+    /// Read the complete instance activity history
+    Activity {
+        /// Instance UUID
+        #[arg(long)]
+        instance: Uuid,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PlaybookTemplatesCmd {
+    /// List current template projections
+    List,
+    /// Get one current template projection
+    Get {
+        /// Template UUID
+        #[arg(long)]
+        template: Uuid,
+    },
+    /// Create revision one from a JSON file
+    Create {
+        /// JSON file containing a TemplateRevision payload
+        #[arg(long)]
+        file: String,
+    },
+    /// Publish the next immutable template revision
+    Update {
+        /// Template UUID
+        #[arg(long)]
+        template: Uuid,
+        /// JSON file containing a TemplateRevision payload
+        #[arg(long)]
+        file: String,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1788,6 +1873,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
+        Cmd::Playbooks(sub) => commands::playbooks::dispatch(sub, &client).await,
         Cmd::Pack(_) => unreachable!("handled above"),
     }
 }
@@ -1820,6 +1906,7 @@ mod tests {
             "notes",
             "pack",
             "patches",
+            "playbooks",
             "pr",
             "reactions",
             "repos",

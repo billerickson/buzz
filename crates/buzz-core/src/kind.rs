@@ -388,6 +388,11 @@ pub const KIND_WORKFLOW_DEF: u32 = 30620;
 /// `hidden_at` per viewer; this is the only Nostr-visible projection of it.
 pub const KIND_DM_VISIBILITY: u32 = 30622;
 
+/// Relay-signed current playbook template projection (`d` = template UUID).
+pub const KIND_PLAYBOOK_TEMPLATE_SNAPSHOT: u32 = 30623;
+/// Relay-signed current channel playbook projection (`d` = instance UUID).
+pub const KIND_PLAYBOOK_INSTANCE_SNAPSHOT: u32 = 30624;
+
 /// Lower bound of the NIP-33 parameterized replaceable range (30000–39999).
 pub const PARAM_REPLACEABLE_KIND_MIN: u32 = 30000;
 /// Upper bound of the NIP-33 parameterized replaceable range (30000–39999).
@@ -433,6 +438,15 @@ pub const KIND_STREAM_REMINDER: u32 = 40007;
 pub const KIND_STREAM_MESSAGE_DIFF: u32 = 40008;
 /// Canvas (shared document) for a channel.
 pub const KIND_CANVAS: u32 = 40100;
+// Native Playbooks (40200–40299)
+/// Owner/admin-authored immutable playbook template revision.
+pub const KIND_PLAYBOOK_TEMPLATE_REVISION: u32 = 40200;
+/// Channel owner/admin request to deep-copy a template into a channel.
+pub const KIND_PLAYBOOK_INSTANCE_INSERT: u32 = 40201;
+/// Channel member complete/reopen action.
+pub const KIND_PLAYBOOK_ITEM_ACTION: u32 = 40202;
+/// Channel owner/admin optimistic-concurrency structural operation.
+pub const KIND_PLAYBOOK_STRUCTURE_OPERATION: u32 = 40203;
 /// System message for channel state changes (join, leave, rename, etc.).
 pub const KIND_SYSTEM_MESSAGE: u32 = 40099;
 
@@ -637,10 +651,16 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_STREAM_REMINDER,
     KIND_STREAM_MESSAGE_DIFF,
     KIND_CANVAS,
+    KIND_PLAYBOOK_TEMPLATE_REVISION,
+    KIND_PLAYBOOK_INSTANCE_INSERT,
+    KIND_PLAYBOOK_ITEM_ACTION,
+    KIND_PLAYBOOK_STRUCTURE_OPERATION,
     KIND_SYSTEM_MESSAGE,
     KIND_CHANNEL_SUMMARY,
     KIND_PRESENCE_SNAPSHOT,
     KIND_DM_VISIBILITY,
+    KIND_PLAYBOOK_TEMPLATE_SNAPSHOT,
+    KIND_PLAYBOOK_INSTANCE_SNAPSHOT,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
     KIND_DM_HIDE,
@@ -750,6 +770,10 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
+            | KIND_PLAYBOOK_TEMPLATE_REVISION
+            | KIND_PLAYBOOK_INSTANCE_INSERT
+            | KIND_PLAYBOOK_ITEM_ACTION
+            | KIND_PLAYBOOK_STRUCTURE_OPERATION
     )
 }
 
@@ -762,6 +786,8 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_CHANNEL_SUMMARY
             | KIND_PRESENCE_SNAPSHOT
             | KIND_DM_VISIBILITY
+            | KIND_PLAYBOOK_TEMPLATE_SNAPSHOT
+            | KIND_PLAYBOOK_INSTANCE_SNAPSHOT
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
     )
@@ -787,6 +813,12 @@ const _: () = assert!(is_parameterized_replaceable(KIND_MANAGED_AGENT)); // 3017
 const _: () = assert!(is_parameterized_replaceable(KIND_WORKFLOW_DEF)); // 30620 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 30300 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(
+    KIND_PLAYBOOK_TEMPLATE_SNAPSHOT
+)); // 30623 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(
+    KIND_PLAYBOOK_INSTANCE_SNAPSHOT
+)); // 30624 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
 
