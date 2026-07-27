@@ -14,6 +14,7 @@ use buzz_core::playbook::{
     TemplateRevision, PLAYBOOK_SCHEMA_VERSION,
 };
 
+use crate::client::create_response_with_id;
 use crate::client::BuzzClient;
 use crate::error::CliError;
 use crate::{PlaybookTemplatesCmd, PlaybooksCmd};
@@ -29,7 +30,7 @@ pub async fn dispatch(command: PlaybooksCmd, client: &BuzzClient) -> Result<(), 
                 channel_id: channel,
                 template_id: template,
             };
-            submit(
+            let response = submit_response(
                 client,
                 KIND_PLAYBOOK_INSTANCE_INSERT,
                 &request,
@@ -39,7 +40,12 @@ pub async fn dispatch(command: PlaybooksCmd, client: &BuzzClient) -> Result<(), 
                     exact_tag("template", template)?,
                 ],
             )
-            .await
+            .await?;
+            println!(
+                "{}",
+                create_response_with_id(&response, "instance_id", &request.instance_id.to_string())
+            );
+            Ok(())
         }
         PlaybooksCmd::Get { instance } => {
             let snapshot = get_instance(client, instance).await?;
@@ -114,13 +120,22 @@ async fn dispatch_templates(
                     "template create requires revision 1".into(),
                 ));
             }
-            submit(
+            let response = submit_response(
                 client,
                 KIND_PLAYBOOK_TEMPLATE_REVISION,
                 &revision,
                 vec![exact_tag("template", revision.template_id)?],
             )
-            .await
+            .await?;
+            println!(
+                "{}",
+                create_response_with_id(
+                    &response,
+                    "template_id",
+                    &revision.template_id.to_string()
+                )
+            );
+            Ok(())
         }
         PlaybookTemplatesCmd::Update { template, file } => {
             let revision: TemplateRevision = read_json(&file)?;
@@ -229,15 +244,23 @@ async fn submit<T: serde::Serialize>(
     payload: &T,
     tags: Vec<Tag>,
 ) -> Result<(), CliError> {
+    let response = submit_response(client, kind, payload, tags).await?;
+    println!("{response}");
+    Ok(())
+}
+
+async fn submit_response<T: serde::Serialize>(
+    client: &BuzzClient,
+    kind: u32,
+    payload: &T,
+    tags: Vec<Tag>,
+) -> Result<String, CliError> {
     let content = serde_json::to_string(payload)
         .map_err(|error| CliError::Other(format!("payload serialization failed: {error}")))?;
     let event =
         client.sign_event(EventBuilder::new(Kind::Custom(kind as u16), content).tags(tags))?;
     match client.submit_event(event).await {
-        Ok(response) => {
-            println!("{response}");
-            Ok(())
-        }
+        Ok(response) => Ok(response),
         Err(CliError::Relay { body, .. }) if body.starts_with("conflict:") => {
             Err(CliError::Conflict(body))
         }

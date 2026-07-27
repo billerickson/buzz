@@ -578,14 +578,14 @@ impl PlaybookInstance {
             }
             StructureOperationKind::ItemUpdate { item_id, text } => {
                 validate_text(text, "item text")?;
-                let item = find_item_mut(&mut self.sections, *item_id)?;
+                let item = find_active_section_item_mut(&mut self.sections, *item_id)?;
                 if item.deleted {
                     return Err(PlaybookError::Removed("item"));
                 }
                 item.text.clone_from(text);
             }
             StructureOperationKind::ItemRemove { item_id } => {
-                let item = find_item_mut(&mut self.sections, *item_id)?;
+                let item = find_active_section_item_mut(&mut self.sections, *item_id)?;
                 if item.deleted {
                     return Err(PlaybookError::Removed("item"));
                 }
@@ -614,7 +614,7 @@ impl PlaybookInstance {
                 if *position <= 0 {
                     return Err(PlaybookError::InvalidPosition(*position));
                 }
-                let item = find_item_mut(&mut self.sections, *item_id)?;
+                let item = find_active_section_item_mut(&mut self.sections, *item_id)?;
                 if item.deleted {
                     return Err(PlaybookError::Removed("item"));
                 }
@@ -670,13 +670,20 @@ impl PlaybookInstance {
     }
 }
 
-fn find_item_mut(
+fn find_active_section_item_mut(
     sections: &mut [PlaybookSection],
     item_id: Uuid,
 ) -> Result<&mut PlaybookItem, PlaybookError> {
-    sections
+    let section = sections
         .iter_mut()
-        .flat_map(|section| section.items.iter_mut())
+        .find(|section| section.items.iter().any(|item| item.item_id == item_id))
+        .ok_or(PlaybookError::ItemNotFound(item_id))?;
+    if section.deleted {
+        return Err(PlaybookError::Removed("section"));
+    }
+    section
+        .items
+        .iter_mut()
         .find(|item| item.item_id == item_id)
         .ok_or(PlaybookError::ItemNotFound(item_id))
 }
@@ -764,6 +771,37 @@ mod tests {
             instance.apply_operation(&StructureOperationKind::ItemRestore { item_id }),
             Err(PlaybookError::Removed("section"))
         );
+    }
+
+    #[test]
+    fn edits_to_items_under_removed_sections_are_rejected() {
+        let source = template();
+        let section_id = source.sections[0].section_id;
+        let item_id = source.sections[0].items[0].item_id;
+        let mut instance = PlaybookInstance::from_template(Uuid::new_v4(), Uuid::new_v4(), &source);
+        instance
+            .apply_operation(&StructureOperationKind::SectionRemove { section_id })
+            .unwrap();
+
+        for operation in [
+            StructureOperationKind::ItemUpdate {
+                item_id,
+                text: "Hidden edit".into(),
+            },
+            StructureOperationKind::ItemRemove { item_id },
+            StructureOperationKind::ItemReorder {
+                item_id,
+                position: 2000,
+            },
+        ] {
+            assert_eq!(
+                instance.apply_operation(&operation),
+                Err(PlaybookError::Removed("section"))
+            );
+        }
+        assert_eq!(instance.sections[0].items[0].text, "Collect access");
+        assert_eq!(instance.sections[0].items[0].position, 1000);
+        assert!(!instance.sections[0].items[0].deleted);
     }
 
     #[test]
