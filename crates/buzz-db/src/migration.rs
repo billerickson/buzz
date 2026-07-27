@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 25);
+        assert_eq!(migrations.len(), 26);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -888,6 +888,12 @@ mod tests {
         assert!(playbooks.contains("CREATE TABLE playbook_structure_operations"));
         assert!(playbooks.contains("idx_playbook_instances_one_active_per_channel"));
         assert!(!migrations[0].sql.as_str().contains("playbook_templates"));
+
+        assert_eq!(migrations[25].version, 26);
+        let semantic_idempotency = migrations[25].sql.as_str();
+        assert!(semantic_idempotency.contains("playbook_item_actions"));
+        assert!(semantic_idempotency.contains("playbook_structure_operations"));
+        assert!(semantic_idempotency.contains("command_payload"));
     }
 
     #[test]

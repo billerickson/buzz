@@ -45,6 +45,9 @@ The script creates unique fixture IDs on every run, then verifies:
 - template create, get, list-compatible projection, and revision update;
 - insertion into an existing channel and source-revision provenance;
 - complete and reopen state with append-only activity;
+- newly signed semantic retries for item and structural commands, including
+  canonical event-ID reuse and no duplicate command, activity row, item, or
+  structural revision;
 - an item-level structural edit and structure revision increment;
 - template-to-instance deep-copy isolation after the template changes; and
 - normalized create envelopes containing `template_id` and `instance_id`.

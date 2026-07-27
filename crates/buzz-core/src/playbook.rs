@@ -863,6 +863,181 @@ mod tests {
     }
 
     #[test]
+    fn every_structural_operation_applies_with_stable_tombstones_and_ids() {
+        let source = template();
+        let original_section_id = source.sections[0].section_id;
+        let original_item_id = source.sections[0].items[0].item_id;
+        let added_section_id = Uuid::new_v4();
+        let added_item_id = Uuid::new_v4();
+        let duplicated_item_id = Uuid::new_v4();
+        let mut instance = PlaybookInstance::from_template(Uuid::new_v4(), Uuid::new_v4(), &source);
+
+        let operations = [
+            StructureOperationKind::SectionAdd {
+                section: PlaybookSection {
+                    section_id: added_section_id,
+                    title: "Launch".into(),
+                    position: 2000,
+                    deleted: false,
+                    items: vec![],
+                },
+            },
+            StructureOperationKind::SectionUpdate {
+                section_id: added_section_id,
+                title: "Launch day".into(),
+            },
+            StructureOperationKind::SectionReorder {
+                section_id: added_section_id,
+                position: 500,
+            },
+            StructureOperationKind::SectionRemove {
+                section_id: added_section_id,
+            },
+            StructureOperationKind::SectionRestore {
+                section_id: added_section_id,
+            },
+            StructureOperationKind::ItemAdd {
+                section_id: original_section_id,
+                item: PlaybookItem {
+                    item_id: added_item_id,
+                    text: "Confirm owner".into(),
+                    position: 2000,
+                    deleted: false,
+                },
+            },
+            StructureOperationKind::ItemUpdate {
+                item_id: added_item_id,
+                text: "Confirm launch owner".into(),
+            },
+            StructureOperationKind::ItemReorder {
+                item_id: added_item_id,
+                position: 500,
+            },
+            StructureOperationKind::ItemRemove {
+                item_id: added_item_id,
+            },
+            StructureOperationKind::ItemRestore {
+                item_id: added_item_id,
+            },
+            StructureOperationKind::ItemDuplicate {
+                item_id: original_item_id,
+                new_item_id: duplicated_item_id,
+                position: 3000,
+            },
+            StructureOperationKind::InstanceRename {
+                name: "Channel launch".into(),
+            },
+        ];
+        for operation in operations {
+            instance.apply_operation(&operation).unwrap();
+        }
+
+        let added_section = instance
+            .sections
+            .iter()
+            .find(|section| section.section_id == added_section_id)
+            .unwrap();
+        assert_eq!(added_section.title, "Launch day");
+        assert_eq!(added_section.position, 500);
+        assert!(!added_section.deleted);
+        let added_item = instance
+            .sections
+            .iter()
+            .flat_map(|section| &section.items)
+            .find(|item| item.item_id == added_item_id)
+            .unwrap();
+        assert_eq!(added_item.text, "Confirm launch owner");
+        assert_eq!(added_item.position, 500);
+        assert!(!added_item.deleted);
+        assert!(instance
+            .sections
+            .iter()
+            .flat_map(|section| &section.items)
+            .any(|item| item.item_id == duplicated_item_id));
+        assert_eq!(instance.name, "Channel launch");
+
+        instance
+            .apply_operation(&StructureOperationKind::InstanceArchive)
+            .unwrap();
+        assert_eq!(instance.status, InstanceStatus::Archived);
+    }
+
+    #[test]
+    fn structural_operation_wire_shapes_round_trip_and_fail_closed() {
+        let section_id = Uuid::new_v4();
+        let item_id = Uuid::new_v4();
+        let variants = vec![
+            StructureOperationKind::SectionAdd {
+                section: PlaybookSection {
+                    section_id,
+                    title: "Section".into(),
+                    position: 1000,
+                    deleted: false,
+                    items: vec![],
+                },
+            },
+            StructureOperationKind::SectionUpdate {
+                section_id,
+                title: "Renamed".into(),
+            },
+            StructureOperationKind::SectionRemove { section_id },
+            StructureOperationKind::SectionRestore { section_id },
+            StructureOperationKind::SectionReorder {
+                section_id,
+                position: 2000,
+            },
+            StructureOperationKind::ItemAdd {
+                section_id,
+                item: PlaybookItem {
+                    item_id,
+                    text: "Item".into(),
+                    position: 1000,
+                    deleted: false,
+                },
+            },
+            StructureOperationKind::ItemUpdate {
+                item_id,
+                text: "Updated".into(),
+            },
+            StructureOperationKind::ItemRemove { item_id },
+            StructureOperationKind::ItemRestore { item_id },
+            StructureOperationKind::ItemReorder {
+                item_id,
+                position: 2000,
+            },
+            StructureOperationKind::ItemDuplicate {
+                item_id,
+                new_item_id: Uuid::new_v4(),
+                position: 3000,
+            },
+            StructureOperationKind::InstanceRename {
+                name: "Renamed".into(),
+            },
+            StructureOperationKind::InstanceArchive,
+        ];
+        for variant in variants {
+            let encoded = serde_json::to_value(&variant).unwrap();
+            let decoded: StructureOperationKind = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, variant);
+        }
+
+        assert!(
+            serde_json::from_value::<StructureOperationKind>(serde_json::json!({
+                "type": "item.unknown",
+                "payload": {"item_id": item_id}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StructureOperationKind>(serde_json::json!({
+                "type": "item.reorder",
+                "payload": {"item_id": item_id}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn malformed_template_shapes_fail_closed() {
         let mut value = template();
         value.schema_version = 2;

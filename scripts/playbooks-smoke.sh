@@ -43,6 +43,8 @@ template_id="$(new_uuid)"
 section_id="$(new_uuid)"
 item_id="$(new_uuid)"
 added_item_id="$(new_uuid)"
+check_action_id="$(new_uuid)"
+check_client_created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 channel_name="playbooks-smoke-$(date +%s)"
 
 cat >"${fixture_dir}/template-v1.json" <<JSON
@@ -131,11 +133,25 @@ jq -e \
     and .instance.sections[0].items[0].text == "Collect analytics access"' \
   <<<"${instance_v1}" >/dev/null
 
-"${buzz_bin}" playbooks check --instance "${instance_id}" --item "${item_id}" >/dev/null
+check_first="$("${buzz_bin}" playbooks check \
+  --instance "${instance_id}" \
+  --item "${item_id}" \
+  --action-id "${check_action_id}" \
+  --client-created-at "${check_client_created_at}")"
+check_event_id="$(jq -er '.event_id' <<<"${check_first}")"
 checked="$("${buzz_bin}" playbooks get --instance "${instance_id}")"
 jq -e --arg item "${item_id}" \
   '.item_states[] | select(.item_id == $item and .completed == true)' \
   <<<"${checked}" >/dev/null
+
+sleep 1
+check_retry="$("${buzz_bin}" playbooks check \
+  --instance "${instance_id}" \
+  --item "${item_id}" \
+  --action-id "${check_action_id}" \
+  --client-created-at "${check_client_created_at}")"
+jq -e --arg event "${check_event_id}" '.event_id == $event and .accepted == true' \
+  <<<"${check_retry}" >/dev/null
 
 "${buzz_bin}" playbooks reopen --instance "${instance_id}" --item "${item_id}" >/dev/null
 reopened="$("${buzz_bin}" playbooks get --instance "${instance_id}")"
@@ -163,14 +179,28 @@ cat >"${fixture_dir}/item-add.json" <<JSON
 }
 JSON
 
-"${buzz_bin}" playbooks edit \
+edit_first="$("${buzz_bin}" playbooks edit \
   --instance "${instance_id}" \
-  --operation-file "${fixture_dir}/item-add.json" >/dev/null
+  --operation-file "${fixture_dir}/item-add.json")"
+edit_event_id="$(jq -er '.event_id' <<<"${edit_first}")"
 edited="$("${buzz_bin}" playbooks get --instance "${instance_id}")"
 jq -e --arg item "${added_item_id}" \
   '.instance.structure_revision == 2
     and any(.instance.sections[].items[]; .item_id == $item and .deleted == false)' \
   <<<"${edited}" >/dev/null
+
+sleep 1
+edit_retry="$("${buzz_bin}" playbooks edit \
+  --instance "${instance_id}" \
+  --operation-file "${fixture_dir}/item-add.json")"
+jq -e --arg event "${edit_event_id}" '.event_id == $event and .accepted == true' \
+  <<<"${edit_retry}" >/dev/null
+after_edit_retry="$("${buzz_bin}" playbooks get --instance "${instance_id}")"
+jq -e --arg item "${added_item_id}" \
+  '.instance.structure_revision == 2
+    and ([.instance.sections[].items[] | select(.item_id == $item)] | length) == 1
+    and ([.activity[] | select(.action == "item.add")] | length) == 1' \
+  <<<"${after_edit_retry}" >/dev/null
 
 "${buzz_bin}" playbooks templates update \
   --template "${template_id}" \
@@ -192,6 +222,14 @@ jq -e \
     and ($actions | index("reopen")) != null
     and ($actions | index("item.add")) != null' \
   <<<"${activity}" >/dev/null
+item_command_events="$("${buzz_bin}" messages get \
+  --channel "${channel_id}" \
+  --kinds 40202)"
+jq -e 'length == 2' <<<"${item_command_events}" >/dev/null
+structure_command_events="$("${buzz_bin}" messages get \
+  --channel "${channel_id}" \
+  --kinds 40203)"
+jq -e 'length == 1' <<<"${structure_command_events}" >/dev/null
 
 cat <<SUMMARY
 Playbooks Phase 1 smoke test passed.
@@ -199,6 +237,6 @@ Playbooks Phase 1 smoke test passed.
   channel:     ${channel_id}
   template:    ${template_id} (current revision 2)
   instance:    ${instance_id} (isolated revision 1 copy)
-  item:        ${item_id} (complete + reopen history verified)
-  added item:  ${added_item_id}
+  item:        ${item_id} (semantic retry + complete/reopen history verified)
+  added item:  ${added_item_id} (semantic edit retry stored once)
 SUMMARY

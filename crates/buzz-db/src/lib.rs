@@ -681,7 +681,7 @@ impl Db {
         action: &buzz_core::playbook::ItemAction,
         event_id: &[u8],
         actor: &[u8],
-    ) -> Result<buzz_core::playbook::InstanceSnapshot> {
+    ) -> Result<playbook::SemanticApply<buzz_core::playbook::InstanceSnapshot>> {
         playbook::apply_item_action(
             &self.pool,
             community_id,
@@ -701,7 +701,7 @@ impl Db {
         operation: &buzz_core::playbook::StructureOperation,
         event_id: &[u8],
         actor: &[u8],
-    ) -> Result<buzz_core::playbook::InstanceSnapshot> {
+    ) -> Result<playbook::SemanticApply<buzz_core::playbook::InstanceSnapshot>> {
         playbook::apply_structure_operation(
             &self.pool,
             community_id,

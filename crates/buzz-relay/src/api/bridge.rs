@@ -676,11 +676,16 @@ pub async fn submit_event(
                 "HTTP bridge request"
             );
         }
-        SubmitOutcome::Rejected { kind, reason, .. } => {
+        SubmitOutcome::Rejected {
+            kind,
+            reason,
+            status,
+            ..
+        } => {
             tracing::warn!(
                 pubkey = %pubkey_hex,
                 route = "/events",
-                status = 400u16,
+                status = status.as_u16(),
                 accepted = false,
                 kind,
                 reason = %reason,
@@ -722,6 +727,7 @@ enum SubmitOutcome {
     Rejected {
         kind: u32,
         reason: String,
+        status: StatusCode,
         response: (StatusCode, Json<Value>),
     },
     /// Any other error (admission, replay, membership, auth, internal) —
@@ -849,14 +855,11 @@ async fn submit_event_authed(
             // in the HTTP response body (unchanged from prior behaviour).
             let reason = truncate_reason(&msg, REJECT_REASON_MAX_BYTES).to_owned();
             crate::handlers::ingest::reject_with_transport("http", "invalid");
-            let status = if msg.starts_with("conflict:") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
+            let status = rejected_status(&msg);
             SubmitOutcome::Rejected {
                 kind: kind_u32,
                 reason,
+                status,
                 response: api_error(status, &msg),
             }
         }
@@ -876,6 +879,14 @@ async fn submit_event_authed(
                 response: e,
             }
         }
+    }
+}
+
+fn rejected_status(message: &str) -> StatusCode {
+    if message.starts_with("conflict:") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 
@@ -2227,6 +2238,18 @@ fn ban_json(b: &buzz_db::moderation::BanRecord) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_rejection_status_matches_response_and_telemetry() {
+        assert_eq!(
+            rejected_status("conflict: stale revision"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            rejected_status("invalid: malformed payload"),
+            StatusCode::BAD_REQUEST
+        );
+    }
     use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
     use std::sync::Mutex;
 

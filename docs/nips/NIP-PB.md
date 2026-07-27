@@ -90,9 +90,12 @@ all accepted actions, actor pubkeys, event IDs, canonical times, and advisory
 client times. Actions targeting an absent, tombstoned, wrong-channel, or
 archived item MUST be rejected.
 
-An exact retry with the same signed event and `action_id` returns the current
-projection without another action row or broadcast. Reusing an `action_id` for
-a different event or payload MUST conflict.
+`action_id` is a semantic idempotency key. A retry by the same actor with the
+same channel, target, action, and payload returns the canonical first event ID
+and current projection even when the retry has a newly signed wrapper and a
+different event ID. The retry MUST NOT be stored or broadcast and MUST NOT add
+an action or activity row. Reuse by a different actor or with changed semantic
+content MUST conflict.
 
 ## Structural Operations
 
@@ -111,9 +114,12 @@ return a conflict and leave the instance unchanged. Remove operations are
 tombstones. Restore reuses the original ID; duplicate requires a fresh item ID.
 Archived instances reject all later mutations.
 
-An exact retry with the same signed event and `operation_id` returns the current
-projection without another audit row, revision increment, or broadcast.
-Reusing an `operation_id` for a different event or instance MUST conflict.
+`operation_id` is a semantic idempotency key. A retry by the same actor with the
+same channel, target, base revision, operation, and payload returns the
+canonical first event ID and current projection even when the retry has a
+newly signed wrapper and a different event ID. The retry MUST NOT be stored or
+broadcast and MUST NOT add an audit/activity row or revision. Reuse by a
+different actor or with changed semantic content MUST conflict.
 
 ## Permissions
 
@@ -139,9 +145,11 @@ Instance snapshots contain the deep-copied structure, latest item states, and
 the complete ordered activity log.
 
 If command persistence and projection succeeded but snapshot publication was
-interrupted, an exact retry MUST compare the durable projection with the
-current snapshot and publish only when repair is needed. A retry MUST NOT emit a
-second identical current-state event.
+interrupted, an exact signed-event retry MUST compare the durable projection
+with the current snapshot and publish only when repair is needed. A semantic
+retry in a new wrapper returns the canonical command result without storing or
+broadcasting the retry wrapper. Neither retry form may emit a second identical
+current-state event.
 
 Clients rebuild state after reconnect by querying `30623`/`30624` snapshots and
 then resuming live subscriptions. They MUST verify event IDs and signatures and

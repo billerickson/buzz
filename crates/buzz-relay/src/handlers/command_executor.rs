@@ -32,6 +32,53 @@ use super::side_effects::{
     publish_dm_visibility_snapshot,
 };
 
+fn log_playbook_accept(
+    event: &Event,
+    channel_id: Uuid,
+    instance_id: Uuid,
+    operation: &str,
+    accepted_at: chrono::DateTime<Utc>,
+) {
+    tracing::info!(
+        target: "buzz_relay::playbooks",
+        event_id = %event.id,
+        actor = %event.pubkey.to_hex(),
+        channel_id = %channel_id,
+        instance_id = %instance_id,
+        operation,
+        accepted_at = %accepted_at.to_rfc3339(),
+        "playbook operation accepted"
+    );
+}
+
+fn log_playbook_snapshot_accept(
+    event: &Event,
+    snapshot: &buzz_core::playbook::InstanceSnapshot,
+    operation: &str,
+) {
+    if let Some(activity) = snapshot
+        .activity
+        .iter()
+        .find(|activity| activity.event_id == event.id.to_hex())
+    {
+        log_playbook_accept(
+            event,
+            snapshot.instance.channel_id,
+            snapshot.instance.instance_id,
+            operation,
+            activity.accepted_at,
+        );
+    } else {
+        warn!(
+            event_id = %event.id,
+            channel_id = %snapshot.instance.channel_id,
+            instance_id = %snapshot.instance.instance_id,
+            operation,
+            "playbook accepted operation missing canonical activity timestamp"
+        );
+    }
+}
+
 /// Route a command-kind event to the appropriate handler.
 pub async fn handle_command(
     tenant: &TenantContext,
@@ -450,6 +497,7 @@ async fn handle_playbook_instance_insert(
         .map_err(|error| IngestError::Internal(format!("error: commit: {error}")))?;
     dispatch_playbook_command(tenant, state, event, Some(channel_id)).await;
     publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+    log_playbook_snapshot_accept(event, &snapshot, "instance.insert");
     if let Err(error) = emit_system_message(
         tenant,
         state,
@@ -508,7 +556,7 @@ async fn handle_playbook_item_action(
         }
         PersistResult::Inserted(tx) => tx,
     };
-    let snapshot = state
+    let applied = state
         .db
         .apply_playbook_item_action(
             tenant.community(),
@@ -519,11 +567,30 @@ async fn handle_playbook_item_action(
         )
         .await
         .map_err(map_playbook_db_error)?;
+    if !applied.applied {
+        tx.rollback()
+            .await
+            .map_err(|error| IngestError::Internal(format!("error: rollback retry: {error}")))?;
+        return Ok(IngestResult {
+            event_id: hex::encode(applied.canonical_event_id),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                serde_json::to_string(&applied.snapshot).unwrap_or_default()
+            ),
+        });
+    }
+    let snapshot = applied.snapshot;
     tx.commit()
         .await
         .map_err(|error| IngestError::Internal(format!("error: commit: {error}")))?;
     dispatch_playbook_command(tenant, state, event, Some(channel_id)).await;
     publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+    let operation = match action.action {
+        buzz_core::playbook::ItemActionKind::Complete => "complete",
+        buzz_core::playbook::ItemActionKind::Reopen => "reopen",
+    };
+    log_playbook_snapshot_accept(event, &snapshot, operation);
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
@@ -569,7 +636,7 @@ async fn handle_playbook_structure_operation(
         }
         PersistResult::Inserted(tx) => tx,
     };
-    let snapshot = state
+    let applied = state
         .db
         .apply_playbook_structure_operation(
             tenant.community(),
@@ -580,11 +647,26 @@ async fn handle_playbook_structure_operation(
         )
         .await
         .map_err(map_playbook_db_error)?;
+    if !applied.applied {
+        tx.rollback()
+            .await
+            .map_err(|error| IngestError::Internal(format!("error: rollback retry: {error}")))?;
+        return Ok(IngestResult {
+            event_id: hex::encode(applied.canonical_event_id),
+            accepted: true,
+            message: format!(
+                "response:{}",
+                serde_json::to_string(&applied.snapshot).unwrap_or_default()
+            ),
+        });
+    }
+    let snapshot = applied.snapshot;
     tx.commit()
         .await
         .map_err(|error| IngestError::Internal(format!("error: commit: {error}")))?;
     dispatch_playbook_command(tenant, state, event, Some(channel_id)).await;
     publish_playbook_instance_snapshot(tenant, state, &snapshot).await?;
+    log_playbook_snapshot_accept(event, &snapshot, operation.operation.name());
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
@@ -1893,6 +1975,32 @@ async fn resume_workflow_after_approval(
 mod playbook_tests {
     use super::*;
     use nostr::Keys;
+    use std::io::Write;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    #[derive(Clone)]
+    struct CapturingMakeWriter(StdArc<Mutex<Vec<u8>>>);
+
+    struct CapturingWriter(StdArc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturingWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingMakeWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturingWriter(StdArc::clone(&self.0))
+        }
+    }
 
     fn event(tags: Vec<Tag>) -> Event {
         EventBuilder::new(Kind::Custom(KIND_PLAYBOOK_ITEM_ACTION as u16), "{}")
@@ -1926,5 +2034,37 @@ mod playbook_tests {
             error,
             IngestError::Rejected(message) if message == "conflict: stale revision"
         ));
+    }
+
+    #[test]
+    fn accepted_playbook_telemetry_has_required_ids_without_checklist_text() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_PLAYBOOK_ITEM_ACTION as u16),
+            "private checklist",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
+        let channel_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let accepted_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let buffer = StdArc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturingMakeWriter(StdArc::clone(&buffer)))
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_playbook_accept(&event, channel_id, instance_id, "complete", accepted_at);
+        });
+        let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(log.contains(&event.id.to_hex()));
+        assert!(log.contains(&keys.public_key().to_hex()));
+        assert!(log.contains(&channel_id.to_string()));
+        assert!(log.contains(&instance_id.to_string()));
+        assert!(log.contains("complete"));
+        assert!(log.contains(&accepted_at.to_rfc3339()));
+        assert!(!log.contains("private checklist"));
     }
 }

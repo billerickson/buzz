@@ -51,11 +51,37 @@ pub async fn dispatch(command: PlaybooksCmd, client: &BuzzClient) -> Result<(), 
             let snapshot = get_instance(client, instance).await?;
             print_json(&snapshot)
         }
-        PlaybooksCmd::Check { instance, item } => {
-            submit_item_action(client, instance, item, ItemActionKind::Complete).await
+        PlaybooksCmd::Check {
+            instance,
+            item,
+            action_id,
+            client_created_at,
+        } => {
+            submit_item_action(
+                client,
+                instance,
+                item,
+                ItemActionKind::Complete,
+                action_id,
+                client_created_at,
+            )
+            .await
         }
-        PlaybooksCmd::Reopen { instance, item } => {
-            submit_item_action(client, instance, item, ItemActionKind::Reopen).await
+        PlaybooksCmd::Reopen {
+            instance,
+            item,
+            action_id,
+            client_created_at,
+        } => {
+            submit_item_action(
+                client,
+                instance,
+                item,
+                ItemActionKind::Reopen,
+                action_id,
+                client_created_at,
+            )
+            .await
         }
         PlaybooksCmd::Edit {
             instance,
@@ -160,15 +186,17 @@ async fn submit_item_action(
     instance: Uuid,
     item: Uuid,
     action: ItemActionKind,
+    action_id: Option<Uuid>,
+    client_created_at: Option<chrono::DateTime<Utc>>,
 ) -> Result<(), CliError> {
     let snapshot = get_instance(client, instance).await?;
     let payload = ItemAction {
         schema_version: PLAYBOOK_SCHEMA_VERSION,
-        action_id: Uuid::new_v4(),
+        action_id: action_id.unwrap_or_else(Uuid::new_v4),
         instance_id: instance,
         item_id: item,
         action,
-        client_created_at: Utc::now(),
+        client_created_at: client_created_at.unwrap_or_else(Utc::now),
     };
     submit(
         client,
@@ -262,10 +290,17 @@ async fn submit_response<T: serde::Serialize>(
     match client.submit_event(event).await {
         Ok(response) => Ok(response),
         Err(CliError::Relay { body, .. }) if body.starts_with("conflict:") => {
-            Err(CliError::Conflict(body))
+            Err(CliError::Conflict(conflict_detail(&body)))
         }
         Err(error) => Err(error),
     }
+}
+
+fn conflict_detail(body: &str) -> String {
+    body.strip_prefix("conflict:")
+        .unwrap_or(body)
+        .trim_start()
+        .to_owned()
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<(), CliError> {
@@ -294,8 +329,8 @@ mod tests {
     }
 
     #[test]
-    fn structure_conflicts_map_to_exit_five_variant() {
-        let error = CliError::Conflict("conflict: current revision 2".into());
-        assert!(matches!(error, CliError::Conflict(_)));
+    fn conflict_variant_formats_prefix_once() {
+        let error = CliError::Conflict(conflict_detail("conflict: current revision 2"));
+        assert_eq!(error.to_string(), "conflict: current revision 2");
     }
 }

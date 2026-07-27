@@ -269,6 +269,12 @@ pub enum PlaybooksCmd {
         /// Item UUID
         #[arg(long)]
         item: Uuid,
+        /// Reuse a semantic action ID for an idempotent retry
+        #[arg(long)]
+        action_id: Option<Uuid>,
+        /// Reuse the advisory client timestamp for an idempotent retry
+        #[arg(long)]
+        client_created_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Reopen an item
     Reopen {
@@ -278,6 +284,12 @@ pub enum PlaybooksCmd {
         /// Item UUID
         #[arg(long)]
         item: Uuid,
+        /// Reuse a semantic action ID for an idempotent retry
+        #[arg(long)]
+        action_id: Option<Uuid>,
+        /// Reuse the advisory client timestamp for an idempotent retry
+        #[arg(long)]
+        client_created_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Apply a structural operation from JSON
     Edit {
